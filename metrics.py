@@ -155,10 +155,6 @@ def llm_grader(
     ]
     resp = llm.invoke(messages)
     content = resp.content
-    print(
-        f"question: {question}, gold_answer: {gold_answer}, generated_answer: {response}"
-    )
-    print(f"Grader response: {content}")
 
     try:
         result = json.loads(content)
