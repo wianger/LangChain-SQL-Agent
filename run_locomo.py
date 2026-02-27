@@ -316,11 +316,13 @@ async def run_experiment(
 
     accuracy_llm = get_llm()
     predictions: list[str] = []
+    questions: list[str] = []
     ground_truths: list[str] = []
     per_item: list[dict] = []
     for qa, answer in zip(retrieve_qa, answers):
         answer = answer or ""
         predictions.append(answer)
+        questions.append(qa["question"])
         ground_truths.append(qa["answer"])
         per_item.append(
             {
@@ -330,7 +332,9 @@ async def run_experiment(
                 "category": qa["category"],
                 "f1": token_f1(answer, qa["answer"]),
                 "recall": token_recall(answer, qa["answer"]),
-                "accuracy": accuracy(accuracy_llm, answer, qa["answer"], "Locomo"),
+                "accuracy": accuracy(
+                    accuracy_llm, qa["question"], answer, qa["answer"], "Locomo"
+                ),
             }
         )
 
@@ -349,7 +353,9 @@ async def run_experiment(
     await _run_concurrent([_do_delete(d) for d in delete_sample_ids], "delete")
 
     # ── Metrics ─────────────────────────────────────────────────────────────
-    qa_metrics = compute_metrics(accuracy_llm, predictions, ground_truths, "Locomo")
+    qa_metrics = compute_metrics(
+        accuracy_llm, questions, predictions, ground_truths, "Locomo"
+    )
 
     cat_preds: dict = defaultdict(list)
     cat_gts: dict = defaultdict(list)
@@ -358,7 +364,7 @@ async def run_experiment(
         cat_gts[item["category"]].append(item["ground_truth"])
     cat_metrics = {
         config.LOCOMO_CATEGORIES.get(cat, str(cat)): compute_metrics(
-            accuracy_llm, cat_preds[cat], cat_gts[cat], "Locomo"
+            accuracy_llm, questions, cat_preds[cat], cat_gts[cat], "Locomo"
         )
         for cat in sorted(cat_preds)
     }

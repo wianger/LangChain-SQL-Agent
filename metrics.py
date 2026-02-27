@@ -170,20 +170,28 @@ def llm_grader(
 
 
 def accuracy(
-    llm, prediction: str, ground_truth: Union[str, List[str]], datasetname
+    llm,
+    question: str,
+    prediction: str,
+    ground_truth: Union[str, List[str]],
+    datasetname,
 ) -> float:
     """1.0 if any gold answer (lowered) is a substring of prediction (lowered)."""
     if isinstance(ground_truth, list):
         return max(
-            (llm_grader(llm, prediction, gt, datasetname) for gt in ground_truth),
+            (
+                llm_grader(llm, question, prediction, gt, datasetname)
+                for gt in ground_truth
+            ),
             default=0.0,
         )
-    return llm_grader(llm, prediction, ground_truth, datasetname)
+    return llm_grader(llm, question, prediction, ground_truth, datasetname)
 
 
 # ── Aggregate ────────────────────────────────────────────────────────────────
 def compute_metrics(
     llm,
+    questions: List[str],
     predictions: List[str],
     ground_truths: List[Union[str, List[str]]],
     dataset_name: str = "Locomo",
@@ -196,7 +204,8 @@ def compute_metrics(
     f1s = [token_f1(p, g) for p, g in zip(predictions, ground_truths)]
     recalls = [token_recall(p, g) for p, g in zip(predictions, ground_truths)]
     accs = [
-        accuracy(llm, p, g, dataset_name) for p, g in zip(predictions, ground_truths)
+        accuracy(llm, q, p, g, dataset_name)
+        for q, p, g in zip(questions, predictions, ground_truths)
     ]
     return {
         "f1": sum(f1s) / n,
