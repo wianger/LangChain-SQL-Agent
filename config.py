@@ -9,10 +9,10 @@ MODEL_NAME = "doubao-seed-1-8-251228"
 EMBEDDING_MODEL = "doubao-embedding-vision-250615"
 
 # ── Dataset paths ────────────────────────────────────────────────────────────
-LOCOMO_DATA_PATH = "/home/wiang/locomo/data/locomo10.json"
-SYLLABUSQA_TEST_PATH = "/home/wiang/SyllabusQA/data/dataset_split/test.json"
-SYLLABI_TEXT_DIR = "/home/wiang/SyllabusQA/syllabi/syllabi_redacted/text"
-SYLLABI_META_PATH = "/home/wiang/SyllabusQA/syllabi/syllabi_meta_info.csv"
+LOCOMO_DATA_PATH = "./datas/locomo/data/locomo10.json"
+SYLLABUSQA_TEST_PATH = "./datas/SyllabusQA/data/dataset_split/test.json"
+SYLLABI_TEXT_DIR = "./datas/SyllabusQA/syllabi/syllabi_redacted/text"
+SYLLABI_META_PATH = "./datas/SyllabusQA/syllabi/syllabi_meta_info.csv"
 
 # ── Database paths ───────────────────────────────────────────────────────────
 DATA_DIR = os.path.join(BASE_DIR, "data")
