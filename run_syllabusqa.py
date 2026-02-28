@@ -92,8 +92,17 @@ def _chunk_text(text_content: str) -> List[str]:
 
 
 def _load_test_qa() -> List[Dict]:
-    with open(config.SYLLABUSQA_TEST_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    results = {}
+    test_file=os.path.join(config.SYLLABUSQA_TEST_PATH, "test.json")
+    with open(test_file, "r", encoding="utf-8") as f:
+        results.update(json.load(f))
+    train_file=os.path.join(config.SYLLABUSQA_TEST_PATH, "train.json")
+    with open(train_file, "r", encoding="utf-8") as f:
+        results.update(json.load(f))
+    val_file=os.path.join(config.SYLLABUSQA_TEST_PATH, "val.json")
+    with open(val_file, "r", encoding="utf-8") as f:
+        results.update(json.load(f))
+    return results
 
 
 # ── Database operations ──────────────────────────────────────────────────────

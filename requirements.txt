@@ -6,3 +6,4 @@ tiktoken>=0.5.0
 pandas>=2.0.0
 numpy>=1.24.0
 tqdm>=4.60.0
+pypdf>=4.0.0
