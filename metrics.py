@@ -17,6 +17,7 @@ REFUSAL_KEYWORDS = [
     "none",
     "unknown",
     "don't know",
+    "No/insufficient information"
 ]
 
 

@@ -250,10 +250,12 @@ async def run_experiment(
     )
 
     accuracy_llm = get_llm()
+    questions: list[str] =[]
     predictions: list[str] = []
     ground_truths: list[str] = []
     per_item: list[dict] = []
     for qa, answer in zip(retrieve_qa, answers):
+        questions.append(qa["question"])
         answer = answer or ""
         predictions.append(answer)
         gt = qa["answer"]
@@ -267,7 +269,7 @@ async def run_experiment(
                 "prediction": answer,
                 "f1": token_f1(answer, gt),
                 "recall": token_recall(answer, gt),
-                "accuracy": accuracy(accuracy_llm, answer, gt, "SyllabusQA"),
+                "accuracy": accuracy(accuracy_llm,qa["question"],answer, gt, "SyllabusQA"),
             }
         )
 
@@ -289,16 +291,18 @@ async def run_experiment(
     await _run_concurrent([_do_delete(n) for n in insert_names], "delete")
 
     # ── Metrics ─────────────────────────────────────────────────────────────
-    qa_metrics = compute_metrics(accuracy_llm, predictions, ground_truths, "SyllabusQA")
+    qa_metrics = compute_metrics(accuracy_llm, questions, predictions, ground_truths, "SyllabusQA")
 
+    type_questions: dict = defaultdict(list)
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     for item in per_item:
         qtype = item.get("question_type", "unknown")
+        type_questions[qtype].append(item["question"])
         type_preds[qtype].append(item["prediction"])
         type_gts[qtype].append(item["ground_truth"])
     type_metrics = {
-        t: compute_metrics(accuracy_llm, type_preds[t], type_gts[t], "SyllabusQA")
+        t: compute_metrics(accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "SyllabusQA")
         for t in sorted(type_preds)
     }
 
