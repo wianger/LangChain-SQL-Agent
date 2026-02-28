@@ -7,6 +7,3 @@
 [submodule "datas/financebench"]
 	path = datas/financebench
 	url = https://github.com/patronus-ai/financebench.git
-[submodule "datas/natural-questions"]
-	path = datas/natural-questions
-	url = https://github.com/google-research-datasets/natural-questions.git
