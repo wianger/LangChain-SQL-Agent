@@ -5,8 +5,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # ── API ──────────────────────────────────────────────────────────────────────
 API_KEY = "API_KEY_HERE"
 BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-MODEL_NAME = "doubao-seed-1-8-251228"
-EMBEDDING_MODEL = "doubao-embedding-vision-250615"
+MODEL_NAME = "doubao-seed-2-0-pro-260215"
+EMBEDDING_MODEL = "doubao-embedding-vision-251215"
 
 # ── Dataset paths ────────────────────────────────────────────────────────────
 LOCOMO_DATA_PATH = "./datas/locomo/data/locomo10.json"
@@ -31,7 +31,7 @@ TIKTOKEN_ENCODING = "cl100k_base"
 # ── Experiment ───────────────────────────────────────────────────────────────
 SMALL_SAMPLE_SIZE = 20
 AGENT_MAX_ITERATIONS = 15
-CONCURRENCY = 10
+CONCURRENCY = 16
 
 # LoCoMo category mapping
 LOCOMO_CATEGORIES = {

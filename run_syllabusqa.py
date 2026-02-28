@@ -238,7 +238,7 @@ async def run_experiment(
             f"Using the syllabus data for '{qa['syllabus_name']}' stored in the database, "
             f"answer the following question. "
             f"Search in both 'syllabi' and 'syllabus_chunks' tables. "
-            f"If the answer cannot be found, reply 'unanswerable'.\n\n"
+            f"If the answer cannot be found, reply 'No/insufficient information'.\n\n"
             f"Question: {qa['question']}"
         )
         async with sem:
