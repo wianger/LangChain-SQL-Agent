@@ -92,16 +92,17 @@ def _chunk_text(text_content: str) -> List[str]:
 
 
 def _load_test_qa() -> List[Dict]:
-    results = {}
-    test_file=os.path.join(config.SYLLABUSQA_TEST_PATH, "test.json")
-    with open(test_file, "r", encoding="utf-8") as f:
-        results.update(json.load(f))
-    train_file=os.path.join(config.SYLLABUSQA_TEST_PATH, "train.json")
-    with open(train_file, "r", encoding="utf-8") as f:
-        results.update(json.load(f))
-    val_file=os.path.join(config.SYLLABUSQA_TEST_PATH, "val.json")
-    with open(val_file, "r", encoding="utf-8") as f:
-        results.update(json.load(f))
+    results: List[Dict] = []
+    for fname in ("test.json", "train.json", "val.json"):
+        fpath = os.path.join(config.SYLLABUSQA_TEST_PATH, fname)
+        if not os.path.exists(fpath):
+            continue
+        with open(fpath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            results.extend(data)
+        elif isinstance(data, dict):
+            results.extend(data.values())
     return results
 
 
