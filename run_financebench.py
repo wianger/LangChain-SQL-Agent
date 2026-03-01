@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 import config
 from metrics import accuracy, compute_metrics, token_f1, token_recall
-from sql_agent import arun_agent, build_agent
+from sql_agent import arun_agent, build_agent,get_llm
 from token_tracker import OperationTracker, TokenTracker
 
 logger = logging.getLogger(__name__)
@@ -322,12 +322,15 @@ async def run_experiment(
         [_do_retrieve(qa) for qa in retrieve_qa], "retrieve"
     )
 
+    accuracy_llm = get_llm()
+    questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[str] = []
     per_item: list[dict] = []
     for qa, answer in zip(retrieve_qa, answers):
         answer = answer or ""
         predictions.append(answer)
+        questions.append(qa["question"])
         gt = qa["answer"]
         ground_truths.append(gt)
         per_item.append({
@@ -341,7 +344,7 @@ async def run_experiment(
             "prediction": answer,
             "f1": token_f1(answer, gt),
             "recall": token_recall(answer, gt),
-            "accuracy": accuracy(answer, gt),
+            "accuracy": accuracy(accuracy_llm, qa["question"], answer, gt,"FinanceBench"),
         })
 
     # ── DELETE ──────────────────────────────────────────────────────────────
@@ -359,16 +362,18 @@ async def run_experiment(
     await _run_concurrent([_do_delete(d) for d in insert_docs], "delete")
 
     # ── Metrics ─────────────────────────────────────────────────────────────
-    qa_metrics = compute_metrics(predictions, ground_truths)
+    qa_metrics = compute_metrics(accuracy_llm, questions, predictions, ground_truths, "FinanceBench")
 
+    type_questions: dict = defaultdict(list)
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     for item in per_item:
         qtype = item["question_type"]
+        type_questions[qtype].append(item["question"])
         type_preds[qtype].append(item["prediction"])
         type_gts[qtype].append(item["ground_truth"])
     type_metrics = {
-        t: compute_metrics(type_preds[t], type_gts[t]) for t in sorted(type_preds)
+        t: compute_metrics(accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "FinanceBench") for t in sorted(type_preds)
     }
 
     reasoning_preds: dict = defaultdict(list)
@@ -378,7 +383,7 @@ async def run_experiment(
         reasoning_preds[r].append(item["prediction"])
         reasoning_gts[r].append(item["ground_truth"])
     reasoning_metrics = {
-        r: compute_metrics(reasoning_preds[r], reasoning_gts[r])
+        r: compute_metrics(accuracy_llm, questions, reasoning_preds[r], reasoning_gts[r], "FinanceBench") 
         for r in sorted(reasoning_preds)
     }
 

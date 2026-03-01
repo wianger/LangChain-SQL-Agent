@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 import config
 from metrics import accuracy, compute_metrics, token_f1, token_recall
-from sql_agent import arun_agent, build_agent
+from sql_agent import arun_agent, build_agent,get_llm
 from token_tracker import OperationTracker, TokenTracker
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,20 @@ CHUNK_OVERLAP = 100
 
 def _load_papers() -> List[Dict]:
     papers: List[Dict] = []
-    with open(config.QASPER_TEST_PATH, "r", encoding="utf-8") as f:
+    test_file = os.path.join(config.QASPER_PATH, "test.json")
+    with open(test_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                papers.append(json.loads(line))
+    train_file = os.path.join(config.QASPER_PATH, "train.json")
+    with open(train_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                papers.append(json.loads(line))
+    valid_file = os.path.join(config.QASPER_PATH, "validation.json")
+    with open(valid_file, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -313,12 +326,15 @@ async def run_experiment(
         [_do_retrieve(qa) for qa in retrieve_qa], "retrieve"
     )
 
+    accuracy_llm = get_llm()
+    questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[Union[str, List[str]]] = []
     per_item: list[dict] = []
     for qa, answer in zip(retrieve_qa, answers):
         answer = answer or ""
         predictions.append(answer)
+        questions.append(qa["question"])
         golds = qa["gold_answers"]
         ground_truths.append(golds)
         per_item.append({
@@ -330,7 +346,7 @@ async def run_experiment(
             "prediction": answer,
             "f1": token_f1(answer, golds),
             "recall": token_recall(answer, golds),
-            "accuracy": accuracy(answer, golds),
+            "accuracy": accuracy(accuracy_llm, qa["question"], answer, golds,"QASPER"),
         })
 
     # ── DELETE ──────────────────────────────────────────────────────────────
@@ -348,16 +364,18 @@ async def run_experiment(
     await _run_concurrent([_do_delete(p) for p in insert_papers], "delete")
 
     # ── Metrics ─────────────────────────────────────────────────────────────
-    qa_metrics = compute_metrics(predictions, ground_truths)
+    qa_metrics = compute_metrics(accuracy_llm, questions, predictions, ground_truths, "QASPER")
 
+    type_questions: dict = defaultdict(list)
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     for item in per_item:
         atype = item["answer_type"]
+        type_questions[atype].append(item["question"])
         type_preds[atype].append(item["prediction"])
         type_gts[atype].append(item["ground_truth"])
     type_metrics = {
-        t: compute_metrics(type_preds[t], type_gts[t]) for t in sorted(type_preds)
+        t: compute_metrics(accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "QASPER") for t in sorted(type_preds)
     }
 
     report = {
