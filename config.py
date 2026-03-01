@@ -20,7 +20,7 @@ FINANCEBENCH_DOC_INFO_PATH = (
 )
 FINANCEBENCH_PDF_DIR = "./datas/financebench/pdfs"
 
-QASPER_TEST_PATH = "./datas/qasper/test.json"
+QASPER_PATH = "./datas/qasper/"
 
 CLAPNQ_DATA_DIR = "./datas/clapnq/annotated_data"
 
