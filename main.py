@@ -82,6 +82,15 @@ async def _async_main(args) -> None:
         print(f"\n[saved] {path}")
         results["qasper"] = report
 
+    if args.dataset in ("clapnq", "all"):
+        from run_clapnq import run_experiment as run_clapnq
+
+        sample = 9999 if args.full else args.sample_size
+        report = await run_clapnq(sample_size=sample, verbose=args.verbose)
+        path = _save_report(report, "clapnq")
+        print(f"\n[saved] {path}")
+        results["clapnq"] = report
+
     # ── Summary ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("  SUMMARY")
@@ -115,7 +124,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LangChain SQL Agent Evaluation")
     parser.add_argument(
         "--dataset",
-        choices=["locomo", "syllabusqa", "financebench", "qasper", "all"],
+        choices=["locomo", "syllabusqa", "financebench", "qasper", "clapnq", "all"],
         default="all",
         help="Which dataset(s) to evaluate (default: all)",
     )

@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 import config
 from metrics import accuracy, compute_metrics, token_f1, token_recall
-from sql_agent import arun_agent, build_agent,get_llm
+from sql_agent import arun_agent, build_agent
 from token_tracker import OperationTracker, TokenTracker
 
 logger = logging.getLogger(__name__)
@@ -55,9 +55,11 @@ CHUNK_OVERLAP = 150
 
 # ── PDF text extraction ──────────────────────────────────────────────────────
 
+
 def _is_docling_available() -> bool:
     try:
         import docling  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -70,6 +72,7 @@ def _extract_pdf_text(pdf_path: str) -> str:
     if _is_docling_available():
         try:
             from docling.document_converter import DocumentConverter  # type: ignore
+
             converter = DocumentConverter()
             result = converter.convert(pdf_path)
             content = result.document.export_to_markdown()
@@ -82,6 +85,7 @@ def _extract_pdf_text(pdf_path: str) -> str:
     # 2) pypdf — default fallback
     try:
         from pypdf import PdfReader  # type: ignore
+
         reader = PdfReader(pdf_path)
         if reader.is_encrypted:
             reader.decrypt("")
@@ -99,6 +103,7 @@ def _extract_pdf_text(pdf_path: str) -> str:
     # 3) pdfplumber — additional fallback
     try:
         import pdfplumber
+
         pages_text: list[str] = []
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
@@ -129,17 +134,20 @@ def _chunk_text(text_content: str) -> List[Dict[str, Any]]:
     idx = 0
     while start < len(text_content):
         end = start + CHUNK_SIZE
-        chunks.append({
-            "chunk_index": idx,
-            "page_num": 0,
-            "content": text_content[start:end],
-        })
+        chunks.append(
+            {
+                "chunk_index": idx,
+                "page_num": 0,
+                "content": text_content[start:end],
+            }
+        )
         idx += 1
         start = end - CHUNK_OVERLAP
     return chunks
 
 
 # ── Data loading helpers ─────────────────────────────────────────────────────
+
 
 def _load_qa() -> List[Dict]:
     items: List[Dict] = []
@@ -163,6 +171,7 @@ def _load_doc_info() -> Dict[str, Dict]:
 
 
 # ── Database operations ──────────────────────────────────────────────────────
+
 
 def _init_db(db_path: str) -> None:
     if os.path.exists(db_path):
@@ -238,12 +247,15 @@ def _bulk_insert(db_path: str, qa_data: List[Dict]) -> float:
     engine.dispose()
     logger.info(
         "Bulk insert: %d documents, %d chunks in %.2fs",
-        len(needed_docs), total_chunks, elapsed,
+        len(needed_docs),
+        total_chunks,
+        elapsed,
     )
     return elapsed
 
 
 # ── Async helpers ────────────────────────────────────────────────────────────
+
 
 async def _run_concurrent(coros: list, desc: str) -> list:
     pbar = tqdm(total=len(coros), desc=desc)
@@ -260,13 +272,17 @@ async def _run_concurrent(coros: list, desc: str) -> list:
 
 # ── Experiment runner ────────────────────────────────────────────────────────
 
+
 async def run_experiment(
     sample_size: int = config.SMALL_SAMPLE_SIZE,
     verbose: bool = False,
 ) -> Dict[str, Any]:
 
     print("\n" + "=" * 60)
-    print("  FinanceBench Evaluation  (sample_size=%d, concurrency=%d)" % (sample_size, config.CONCURRENCY))
+    print(
+        "  FinanceBench Evaluation  (sample_size=%d, concurrency=%d)"
+        % (sample_size, config.CONCURRENCY)
+    )
     print("=" * 60)
 
     all_qa = _load_qa()
@@ -288,7 +304,10 @@ async def run_experiment(
     sem = asyncio.Semaphore(config.CONCURRENCY)
 
     # ── INSERT ──────────────────────────────────────────────────────────────
-    print("\n[INSERT] %d records (concurrency=%d)..." % (len(insert_docs), config.CONCURRENCY))
+    print(
+        "\n[INSERT] %d records (concurrency=%d)..."
+        % (len(insert_docs), config.CONCURRENCY)
+    )
 
     async def _do_insert(doc_name):
         prompt = (
@@ -303,7 +322,10 @@ async def run_experiment(
     await _run_concurrent([_do_insert(d) for d in insert_docs], "insert")
 
     # ── RETRIEVE ────────────────────────────────────────────────────────────
-    print("\n[RETRIEVE] %d questions (concurrency=%d)..." % (len(retrieve_qa), config.CONCURRENCY))
+    print(
+        "\n[RETRIEVE] %d questions (concurrency=%d)..."
+        % (len(retrieve_qa), config.CONCURRENCY)
+    )
 
     async def _do_retrieve(qa):
         prompt = (
@@ -322,33 +344,35 @@ async def run_experiment(
         [_do_retrieve(qa) for qa in retrieve_qa], "retrieve"
     )
 
-    accuracy_llm = get_llm()
-    questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[str] = []
     per_item: list[dict] = []
     for qa, answer in zip(retrieve_qa, answers):
         answer = answer or ""
         predictions.append(answer)
-        questions.append(qa["question"])
         gt = qa["answer"]
         ground_truths.append(gt)
-        per_item.append({
-            "financebench_id": qa["financebench_id"],
-            "question": qa["question"],
-            "doc_name": qa["doc_name"],
-            "company": qa["company"],
-            "question_type": qa.get("question_type", ""),
-            "question_reasoning": qa.get("question_reasoning") or "unknown",
-            "ground_truth": gt,
-            "prediction": answer,
-            "f1": token_f1(answer, gt),
-            "recall": token_recall(answer, gt),
-            "accuracy": accuracy(accuracy_llm, qa["question"], answer, gt,"FinanceBench"),
-        })
+        per_item.append(
+            {
+                "financebench_id": qa["financebench_id"],
+                "question": qa["question"],
+                "doc_name": qa["doc_name"],
+                "company": qa["company"],
+                "question_type": qa.get("question_type", ""),
+                "question_reasoning": qa.get("question_reasoning") or "unknown",
+                "ground_truth": gt,
+                "prediction": answer,
+                "f1": token_f1(answer, gt),
+                "recall": token_recall(answer, gt),
+                "accuracy": accuracy(answer, gt),
+            }
+        )
 
     # ── DELETE ──────────────────────────────────────────────────────────────
-    print("\n[DELETE] %d records (concurrency=%d)..." % (len(insert_docs), config.CONCURRENCY))
+    print(
+        "\n[DELETE] %d records (concurrency=%d)..."
+        % (len(insert_docs), config.CONCURRENCY)
+    )
 
     async def _do_delete(doc_name):
         prompt = (
@@ -362,18 +386,16 @@ async def run_experiment(
     await _run_concurrent([_do_delete(d) for d in insert_docs], "delete")
 
     # ── Metrics ─────────────────────────────────────────────────────────────
-    qa_metrics = compute_metrics(accuracy_llm, questions, predictions, ground_truths, "FinanceBench")
+    qa_metrics = compute_metrics(predictions, ground_truths)
 
-    type_questions: dict = defaultdict(list)
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     for item in per_item:
         qtype = item["question_type"]
-        type_questions[qtype].append(item["question"])
         type_preds[qtype].append(item["prediction"])
         type_gts[qtype].append(item["ground_truth"])
     type_metrics = {
-        t: compute_metrics(accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "FinanceBench") for t in sorted(type_preds)
+        t: compute_metrics(type_preds[t], type_gts[t]) for t in sorted(type_preds)
     }
 
     reasoning_preds: dict = defaultdict(list)
@@ -383,7 +405,7 @@ async def run_experiment(
         reasoning_preds[r].append(item["prediction"])
         reasoning_gts[r].append(item["ground_truth"])
     reasoning_metrics = {
-        r: compute_metrics(accuracy_llm, questions, reasoning_preds[r], reasoning_gts[r], "FinanceBench") 
+        r: compute_metrics(reasoning_preds[r], reasoning_gts[r])
         for r in sorted(reasoning_preds)
     }
 
@@ -418,10 +440,14 @@ def _print_report(r: Dict) -> None:
     print(f"  Accuracy: {qm['accuracy']:.4f}")
     print()
     for t, m in r.get("qa_metrics_by_type", {}).items():
-        print(f"  [type: {t}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}")
+        print(
+            f"  [type: {t}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}"
+        )
     print()
     for t, m in r.get("qa_metrics_by_reasoning", {}).items():
-        print(f"  [reasoning: {t}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}")
+        print(
+            f"  [reasoning: {t}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}"
+        )
     print()
     print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
 

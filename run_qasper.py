@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 import config
 from metrics import accuracy, compute_metrics, token_f1, token_recall
-from sql_agent import arun_agent, build_agent,get_llm
+from sql_agent import arun_agent, build_agent
 from token_tracker import OperationTracker, TokenTracker
 
 logger = logging.getLogger(__name__)
@@ -68,22 +68,10 @@ CHUNK_OVERLAP = 100
 
 # ── Data loading helpers ─────────────────────────────────────────────────────
 
+
 def _load_papers() -> List[Dict]:
     papers: List[Dict] = []
-    test_file = os.path.join(config.QASPER_PATH, "test.json")
-    with open(test_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                papers.append(json.loads(line))
-    train_file = os.path.join(config.QASPER_PATH, "train.json")
-    with open(train_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                papers.append(json.loads(line))
-    valid_file = os.path.join(config.QASPER_PATH, "validation.json")
-    with open(valid_file, "r", encoding="utf-8") as f:
+    with open(config.QASPER_TEST_PATH, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
@@ -133,20 +121,26 @@ def _extract_qa(papers: List[Dict]) -> List[Dict]:
                     gold_texts.append(txt)
                 type_counts[atype] += 1
 
-            majority_type = max(type_counts, key=lambda k: type_counts[k]) if type_counts else "unknown"
+            majority_type = (
+                max(type_counts, key=lambda k: type_counts[k])
+                if type_counts
+                else "unknown"
+            )
 
             if not gold_texts:
                 gold_texts = ["unanswerable"]
                 majority_type = "unanswerable"
 
-            qa_list.append({
-                "paper_id": pid,
-                "title": title,
-                "question_id": question_ids[idx],
-                "question": questions[idx],
-                "gold_answers": gold_texts,
-                "answer_type": majority_type,
-            })
+            qa_list.append(
+                {
+                    "paper_id": pid,
+                    "title": title,
+                    "question_id": question_ids[idx],
+                    "question": questions[idx],
+                    "gold_answers": gold_texts,
+                    "answer_type": majority_type,
+                }
+            )
     return qa_list
 
 
@@ -158,11 +152,13 @@ def _build_sections(paper: Dict) -> List[Dict[str, Any]]:
     sections: List[Dict[str, Any]] = []
     for i, (sname, paras) in enumerate(zip(section_names, paragraphs)):
         content = "\n".join(paras) if isinstance(paras, list) else str(paras)
-        sections.append({
-            "section_index": i,
-            "section_name": sname,
-            "content": content,
-        })
+        sections.append(
+            {
+                "section_index": i,
+                "section_name": sname,
+                "content": content,
+            }
+        )
     return sections
 
 
@@ -179,6 +175,7 @@ def _chunk_text(text_content: str) -> List[str]:
 
 
 # ── Database operations ──────────────────────────────────────────────────────
+
 
 def _init_db(db_path: str) -> None:
     if os.path.exists(db_path):
@@ -241,12 +238,15 @@ def _bulk_insert(db_path: str, papers: List[Dict]) -> float:
     engine.dispose()
     logger.info(
         "Bulk insert: %d papers, %d chunks in %.2fs",
-        len(papers), total_chunks, elapsed,
+        len(papers),
+        total_chunks,
+        elapsed,
     )
     return elapsed
 
 
 # ── Async helpers ────────────────────────────────────────────────────────────
+
 
 async def _run_concurrent(coros: list, desc: str) -> list:
     pbar = tqdm(total=len(coros), desc=desc)
@@ -263,13 +263,17 @@ async def _run_concurrent(coros: list, desc: str) -> list:
 
 # ── Experiment runner ────────────────────────────────────────────────────────
 
+
 async def run_experiment(
     sample_size: int = config.SMALL_SAMPLE_SIZE,
     verbose: bool = False,
 ) -> Dict[str, Any]:
 
     print("\n" + "=" * 60)
-    print("  QASPER Evaluation  (sample_size=%d, concurrency=%d)" % (sample_size, config.CONCURRENCY))
+    print(
+        "  QASPER Evaluation  (sample_size=%d, concurrency=%d)"
+        % (sample_size, config.CONCURRENCY)
+    )
     print("=" * 60)
 
     papers = _load_papers()
@@ -292,7 +296,10 @@ async def run_experiment(
     sem = asyncio.Semaphore(config.CONCURRENCY)
 
     # ── INSERT ──────────────────────────────────────────────────────────────
-    print("\n[INSERT] %d records (concurrency=%d)..." % (len(insert_papers), config.CONCURRENCY))
+    print(
+        "\n[INSERT] %d records (concurrency=%d)..."
+        % (len(insert_papers), config.CONCURRENCY)
+    )
 
     async def _do_insert(pid):
         prompt = (
@@ -307,7 +314,10 @@ async def run_experiment(
     await _run_concurrent([_do_insert(p) for p in insert_papers], "insert")
 
     # ── RETRIEVE ────────────────────────────────────────────────────────────
-    print("\n[RETRIEVE] %d questions (concurrency=%d)..." % (len(retrieve_qa), config.CONCURRENCY))
+    print(
+        "\n[RETRIEVE] %d questions (concurrency=%d)..."
+        % (len(retrieve_qa), config.CONCURRENCY)
+    )
 
     async def _do_retrieve(qa):
         prompt = (
@@ -326,31 +336,33 @@ async def run_experiment(
         [_do_retrieve(qa) for qa in retrieve_qa], "retrieve"
     )
 
-    accuracy_llm = get_llm()
-    questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[Union[str, List[str]]] = []
     per_item: list[dict] = []
     for qa, answer in zip(retrieve_qa, answers):
         answer = answer or ""
         predictions.append(answer)
-        questions.append(qa["question"])
         golds = qa["gold_answers"]
         ground_truths.append(golds)
-        per_item.append({
-            "paper_id": qa["paper_id"],
-            "question_id": qa["question_id"],
-            "question": qa["question"],
-            "answer_type": qa["answer_type"],
-            "ground_truth": golds,
-            "prediction": answer,
-            "f1": token_f1(answer, golds),
-            "recall": token_recall(answer, golds),
-            "accuracy": accuracy(accuracy_llm, qa["question"], answer, golds,"QASPER"),
-        })
+        per_item.append(
+            {
+                "paper_id": qa["paper_id"],
+                "question_id": qa["question_id"],
+                "question": qa["question"],
+                "answer_type": qa["answer_type"],
+                "ground_truth": golds,
+                "prediction": answer,
+                "f1": token_f1(answer, golds),
+                "recall": token_recall(answer, golds),
+                "accuracy": accuracy(answer, golds),
+            }
+        )
 
     # ── DELETE ──────────────────────────────────────────────────────────────
-    print("\n[DELETE] %d records (concurrency=%d)..." % (len(insert_papers), config.CONCURRENCY))
+    print(
+        "\n[DELETE] %d records (concurrency=%d)..."
+        % (len(insert_papers), config.CONCURRENCY)
+    )
 
     async def _do_delete(pid):
         prompt = (
@@ -364,18 +376,16 @@ async def run_experiment(
     await _run_concurrent([_do_delete(p) for p in insert_papers], "delete")
 
     # ── Metrics ─────────────────────────────────────────────────────────────
-    qa_metrics = compute_metrics(accuracy_llm, questions, predictions, ground_truths, "QASPER")
+    qa_metrics = compute_metrics(predictions, ground_truths)
 
-    type_questions: dict = defaultdict(list)
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     for item in per_item:
         atype = item["answer_type"]
-        type_questions[atype].append(item["question"])
         type_preds[atype].append(item["prediction"])
         type_gts[atype].append(item["ground_truth"])
     type_metrics = {
-        t: compute_metrics(accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "QASPER") for t in sorted(type_preds)
+        t: compute_metrics(type_preds[t], type_gts[t]) for t in sorted(type_preds)
     }
 
     report = {
@@ -411,7 +421,9 @@ def _print_report(r: Dict) -> None:
     print(f"  Papers: {r['num_papers']}  Total QA: {r['num_qa_total']}")
     print()
     for t, m in r.get("qa_metrics_by_answer_type", {}).items():
-        print(f"  [{t}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}")
+        print(
+            f"  [{t}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}"
+        )
     print()
     print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
 

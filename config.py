@@ -22,6 +22,8 @@ FINANCEBENCH_PDF_DIR = "./datas/financebench/pdfs"
 
 QASPER_TEST_PATH = "./datas/qasper/test.json"
 
+CLAPNQ_DATA_DIR = "./datas/clapnq/annotated_data"
+
 # ── Database paths ───────────────────────────────────────────────────────────
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -30,6 +32,7 @@ LOCOMO_DB = os.path.join(DATA_DIR, "locomo.db")
 SYLLABUSQA_DB = os.path.join(DATA_DIR, "syllabusqa.db")
 FINANCEBENCH_DB = os.path.join(DATA_DIR, "financebench.db")
 QASPER_DB = os.path.join(DATA_DIR, "qasper.db")
+CLAPNQ_DB = os.path.join(DATA_DIR, "clapnq.db")
 
 # ── Results ──────────────────────────────────────────────────────────────────
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
