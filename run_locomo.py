@@ -127,11 +127,10 @@ def _extract_qa(data: List[Dict]) -> List[Dict]:
         )
         for qa in entry["qa"]:
             cat = qa["category"]
-            question = qa["question"]
             if cat == 5:
-                answer = "unanswerable"
-            else:
-                answer = str(qa.get("answer", ""))
+                continue
+            question = qa["question"]
+            answer = str(qa.get("answer", ""))
             qa_list.append(
                 {
                     "sample_id": sid,
@@ -248,8 +247,6 @@ async def run_experiment(
 
     data = _load_json()
     all_qa = _extract_qa(data)
-    qa_with_answer = [q for q in all_qa if q["category"] != 5]
-    qa_adversarial = [q for q in all_qa if q["category"] == 5]
 
     db_path = config.LOCOMO_DB
     _init_db(db_path)
@@ -260,12 +257,7 @@ async def run_experiment(
     agent = build_agent(db_path, tracker, verbose=verbose)
 
     rng = random.Random(42)
-    retrieve_qa = rng.sample(qa_with_answer, min(sample_size, len(qa_with_answer)))
-    if qa_adversarial:
-        adv_sample = rng.sample(
-            qa_adversarial, min(max(sample_size // 5, 2), len(qa_adversarial))
-        )
-        retrieve_qa.extend(adv_sample)
+    retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
 
     conv_rows, _, _ = _extract_rows(data)
     insert_sample = rng.sample(conv_rows, min(sample_size, len(conv_rows)))
