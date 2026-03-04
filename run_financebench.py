@@ -21,7 +21,7 @@ from tqdm import tqdm
 
 import config
 from metrics import accuracy, compute_metrics, token_f1, token_recall
-from sql_agent import arun_agent, build_agent
+from sql_agent import arun_agent, build_agent, get_llm
 from token_tracker import OperationTracker, TokenTracker
 
 logger = logging.getLogger(__name__)
@@ -294,6 +294,7 @@ async def run_experiment(
     tracker = TokenTracker(config.TIKTOKEN_ENCODING)
     op = OperationTracker(tracker)
     agent = build_agent(db_path, tracker, verbose=verbose)
+    accuracy_llm = get_llm()
 
     rng = random.Random(42)
     retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
@@ -364,7 +365,9 @@ async def run_experiment(
                 "prediction": answer,
                 "f1": token_f1(answer, gt),
                 "recall": token_recall(answer, gt),
-                "accuracy": accuracy(answer, gt),
+                "accuracy": accuracy(
+                    accuracy_llm, qa["question"], answer, gt, "financebench"
+                ),
             }
         )
 
@@ -386,26 +389,39 @@ async def run_experiment(
     await _run_concurrent([_do_delete(d) for d in insert_docs], "delete")
 
     # ── Metrics ─────────────────────────────────────────────────────────────
-    qa_metrics = compute_metrics(predictions, ground_truths)
+    questions = [q["question"] for q in retrieve_qa]
+    qa_metrics = compute_metrics(
+        accuracy_llm, questions, predictions, ground_truths, "financebench"
+    )
 
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
+    type_questions: dict = defaultdict(list)
     for item in per_item:
         qtype = item["question_type"]
         type_preds[qtype].append(item["prediction"])
         type_gts[qtype].append(item["ground_truth"])
+        type_questions[qtype].append(item["question"])
     type_metrics = {
-        t: compute_metrics(type_preds[t], type_gts[t]) for t in sorted(type_preds)
+        t: compute_metrics(
+            accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "financebench"
+        )
+        for t in sorted(type_preds)
     }
 
     reasoning_preds: dict = defaultdict(list)
     reasoning_gts: dict = defaultdict(list)
+    reasoning_questions: dict = defaultdict(list)
     for item in per_item:
         r = item["question_reasoning"]
         reasoning_preds[r].append(item["prediction"])
         reasoning_gts[r].append(item["ground_truth"])
+        reasoning_questions[r].append(item["question"])
     reasoning_metrics = {
-        r: compute_metrics(reasoning_preds[r], reasoning_gts[r])
+        r: compute_metrics(
+            accuracy_llm, reasoning_questions[r], reasoning_preds[r],
+            reasoning_gts[r], "financebench"
+        )
         for r in sorted(reasoning_preds)
     }
 
