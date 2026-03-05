@@ -91,6 +91,15 @@ async def _async_main(args) -> None:
         print(f"\n[saved] {path}")
         results["clapnq"] = report
 
+    if args.dataset in ("hotpotqa", "all"):
+        from run_hotpotqa import run_experiment as run_hotpotqa
+
+        sample = 9999 if args.full else args.sample_size
+        report = await run_hotpotqa(sample_size=sample, verbose=args.verbose)
+        path = _save_report(report, "hotpotqa")
+        print(f"\n[saved] {path}")
+        results["hotpotqa"] = report
+
     # ── Summary ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("  SUMMARY")
@@ -124,7 +133,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LangChain SQL Agent Evaluation")
     parser.add_argument(
         "--dataset",
-        choices=["locomo", "syllabusqa", "financebench", "qasper", "clapnq", "all"],
+        choices=["locomo", "syllabusqa", "financebench", "qasper", "clapnq", "hotpotqa", "all"],
         default="all",
         help="Which dataset(s) to evaluate (default: all)",
     )

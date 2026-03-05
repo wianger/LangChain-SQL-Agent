@@ -24,6 +24,9 @@ QASPER_PATH = "./datas/qasper/"
 
 CLAPNQ_DATA_DIR = "./datas/clapnq/annotated_data"
 
+HOTPOTQA_QA_PATH = "./datas/HotpotQA_small/hotpot_qa_100.json"
+HOTPOTQA_ARTICLES_PATH = "./datas/HotpotQA_small/hotpot_articles.json"
+
 # ── Database paths ───────────────────────────────────────────────────────────
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -33,6 +36,7 @@ SYLLABUSQA_DB = os.path.join(DATA_DIR, "syllabusqa.db")
 FINANCEBENCH_DB = os.path.join(DATA_DIR, "financebench.db")
 QASPER_DB = os.path.join(DATA_DIR, "qasper.db")
 CLAPNQ_DB = os.path.join(DATA_DIR, "clapnq.db")
+HOTPOTQA_DB = os.path.join(DATA_DIR, "hotpotqa.db")
 
 # ── Results ──────────────────────────────────────────────────────────────────
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
