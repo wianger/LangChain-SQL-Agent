@@ -110,7 +110,9 @@ async def _async_main(args) -> None:
         ret = r.get("retrieve_metrics", {})
         dl = r.get("delete_metrics", {})
         print(f"\n  [{ds.upper()}]")
-        print(f"    F1={qm['f1']:.4f}  Recall={qm['recall']:.4f}  Accuracy={qm['accuracy']:.4f}")
+        print(
+            f"    F1={qm['f1']:.4f}  Recall={qm['recall']:.4f}  Accuracy={qm['accuracy']:.4f}"
+        )
         if ret:
             print(
                 f"    Retrieve: avg_time={ret['avg_time']:.2f}s  "
@@ -133,7 +135,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LangChain SQL Agent Evaluation")
     parser.add_argument(
         "--dataset",
-        choices=["locomo", "syllabusqa", "financebench", "qasper", "clapnq", "hotpotqa", "all"],
+        choices=[
+            "locomo",
+            "syllabusqa",
+            "financebench",
+            "qasper",
+            "clapnq",
+            "hotpotqa",
+            "all",
+        ],
         default="all",
         help="Which dataset(s) to evaluate (default: all)",
     )

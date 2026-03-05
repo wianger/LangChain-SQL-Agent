@@ -68,6 +68,7 @@ CHUNK_OVERLAP = 100
 
 # ── Data loading helpers ─────────────────────────────────────────────────────
 
+
 def _load_papers() -> List[Dict]:
     papers: List[Dict] = []
     test_file = os.path.join(config.QASPER_PATH, "test.json")
@@ -133,20 +134,26 @@ def _extract_qa(papers: List[Dict]) -> List[Dict]:
                     gold_texts.append(txt)
                 type_counts[atype] += 1
 
-            majority_type = max(type_counts, key=lambda k: type_counts[k]) if type_counts else "unknown"
+            majority_type = (
+                max(type_counts, key=lambda k: type_counts[k])
+                if type_counts
+                else "unknown"
+            )
 
             if not gold_texts:
                 gold_texts = ["unanswerable"]
                 majority_type = "unanswerable"
 
-            qa_list.append({
-                "paper_id": pid,
-                "title": title,
-                "question_id": question_ids[idx],
-                "question": questions[idx],
-                "gold_answers": gold_texts,
-                "answer_type": majority_type,
-            })
+            qa_list.append(
+                {
+                    "paper_id": pid,
+                    "title": title,
+                    "question_id": question_ids[idx],
+                    "question": questions[idx],
+                    "gold_answers": gold_texts,
+                    "answer_type": majority_type,
+                }
+            )
     return qa_list
 
 
@@ -158,11 +165,13 @@ def _build_sections(paper: Dict) -> List[Dict[str, Any]]:
     sections: List[Dict[str, Any]] = []
     for i, (sname, paras) in enumerate(zip(section_names, paragraphs)):
         content = "\n".join(paras) if isinstance(paras, list) else str(paras)
-        sections.append({
-            "section_index": i,
-            "section_name": sname,
-            "content": content,
-        })
+        sections.append(
+            {
+                "section_index": i,
+                "section_name": sname,
+                "content": content,
+            }
+        )
     return sections
 
 
@@ -179,6 +188,7 @@ def _chunk_text(text_content: str) -> List[str]:
 
 
 # ── Database operations ──────────────────────────────────────────────────────
+
 
 def _init_db(db_path: str) -> None:
     if os.path.exists(db_path):
@@ -241,12 +251,15 @@ def _bulk_insert(db_path: str, papers: List[Dict]) -> float:
     engine.dispose()
     logger.info(
         "Bulk insert: %d papers, %d chunks in %.2fs",
-        len(papers), total_chunks, elapsed,
+        len(papers),
+        total_chunks,
+        elapsed,
     )
     return elapsed
 
 
 # ── Async helpers ────────────────────────────────────────────────────────────
+
 
 async def _run_concurrent(coros: list, desc: str) -> list:
     pbar = tqdm(total=len(coros), desc=desc)
@@ -263,13 +276,17 @@ async def _run_concurrent(coros: list, desc: str) -> list:
 
 # ── Experiment runner ────────────────────────────────────────────────────────
 
+
 async def run_experiment(
     sample_size: int = config.SMALL_SAMPLE_SIZE,
     verbose: bool = False,
 ) -> Dict[str, Any]:
 
     print("\n" + "=" * 60)
-    print("  QASPER Evaluation  (sample_size=%d, concurrency=%d)" % (sample_size, config.CONCURRENCY))
+    print(
+        "  QASPER Evaluation  (sample_size=%d, concurrency=%d)"
+        % (sample_size, config.CONCURRENCY)
+    )
     print("=" * 60)
 
     papers = _load_papers()
@@ -293,7 +310,10 @@ async def run_experiment(
     sem = asyncio.Semaphore(config.CONCURRENCY)
 
     # ── INSERT ──────────────────────────────────────────────────────────────
-    print("\n[INSERT] %d records (concurrency=%d)..." % (len(insert_papers), config.CONCURRENCY))
+    print(
+        "\n[INSERT] %d records (concurrency=%d)..."
+        % (len(insert_papers), config.CONCURRENCY)
+    )
 
     async def _do_insert(pid):
         prompt = (
@@ -308,7 +328,10 @@ async def run_experiment(
     await _run_concurrent([_do_insert(p) for p in insert_papers], "insert")
 
     # ── RETRIEVE ────────────────────────────────────────────────────────────
-    print("\n[RETRIEVE] %d questions (concurrency=%d)..." % (len(retrieve_qa), config.CONCURRENCY))
+    print(
+        "\n[RETRIEVE] %d questions (concurrency=%d)..."
+        % (len(retrieve_qa), config.CONCURRENCY)
+    )
 
     async def _do_retrieve(qa):
         prompt = (
@@ -355,7 +378,10 @@ async def run_experiment(
         )
 
     # ── DELETE ──────────────────────────────────────────────────────────────
-    print("\n[DELETE] %d records (concurrency=%d)..." % (len(insert_papers), config.CONCURRENCY))
+    print(
+        "\n[DELETE] %d records (concurrency=%d)..."
+        % (len(insert_papers), config.CONCURRENCY)
+    )
 
     async def _do_delete(pid):
         prompt = (
@@ -374,7 +400,6 @@ async def run_experiment(
         accuracy_llm, questions, predictions, ground_truths, "qasper"
     )
 
-    type_questions: dict = defaultdict(list)
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     type_questions: dict = defaultdict(list)
@@ -424,7 +449,9 @@ def _print_report(r: Dict) -> None:
     print(f"  Papers: {r['num_papers']}  Total QA: {r['num_qa_total']}")
     print()
     for t, m in r.get("qa_metrics_by_answer_type", {}).items():
-        print(f"  [{t}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}")
+        print(
+            f"  [{t}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}"
+        )
     print()
     print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
 

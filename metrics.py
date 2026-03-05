@@ -8,6 +8,7 @@ import re
 import string
 from collections import Counter
 from typing import Any, Dict, List, Union
+
 from langchain_core.messages import HumanMessage, SystemMessage
 
 REFUSAL_KEYWORDS = [
@@ -134,7 +135,9 @@ def token_recall(
     """
     retrieved = [prediction]
     evidence = ground_truth if isinstance(ground_truth, list) else [ground_truth]
-    return _token_recall_single(retrieved, evidence, soft_threshold, min_soft_match_tokens)
+    return _token_recall_single(
+        retrieved, evidence, soft_threshold, min_soft_match_tokens
+    )
 
 
 # ── Accuracy (LLM-as-judge) ──────────────────────────────────────────────────
@@ -273,9 +276,11 @@ def accuracy(
             llm_grader(llm, question, prediction, gt, dataset_name)
             for gt in ground_truth
         ]
-        return max(results, key=lambda r: r["score"]) if results else {
-            "score": 0, "reasoning": "No ground truth", "prompt_type": "N/A"
-        }
+        return (
+            max(results, key=lambda r: r["score"])
+            if results
+            else {"score": 0, "reasoning": "No ground truth", "prompt_type": "N/A"}
+        )
     return llm_grader(llm, question, prediction, ground_truth, dataset_name)
 
 
