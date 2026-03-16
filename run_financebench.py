@@ -409,11 +409,20 @@ async def run_experiment(
 
         per_item: list = []
         all_retrieved: list[list[str]] = []
+        evidences: list[list[str]] = []
         for qa in retrieve_qa:
             key = (qa["financebench_id"], qa["question"])
             answer, retrieved = answers_by_qa.get(key, ("", []))
             gt = qa["answer"]
+            ev = [
+                e["evidence_text"]
+                for e in qa.get("evidence", [])
+                if e.get("evidence_text")
+            ]
+            if not ev:
+                ev = [gt]
             all_retrieved.append(retrieved)
+            evidences.append(ev)
             per_item.append(
                 {
                     "financebench_id": qa["financebench_id"],
@@ -423,10 +432,11 @@ async def run_experiment(
                     "question_type": qa.get("question_type", ""),
                     "question_reasoning": qa.get("question_reasoning") or "unknown",
                     "ground_truth": gt,
+                    "evidence_texts": ev,
                     "prediction": answer,
                     "retrieved_texts": retrieved,
                     "f1": token_f1(answer, gt),
-                    "recall": token_recall(answer, gt, retrieved_texts=retrieved),
+                    "recall": token_recall(answer, ev, retrieved_texts=retrieved),
                     "accuracy": accuracy(
                         accuracy_llm, qa["question"], answer, gt, "financebench"
                     ),
@@ -443,18 +453,21 @@ async def run_experiment(
             predictions,
             ground_truths,
             "financebench",
+            evidences=evidences,
             retrieved_texts_list=all_retrieved,
         )
 
         type_preds: dict = defaultdict(list)
         type_gts: dict = defaultdict(list)
         type_questions: dict = defaultdict(list)
+        type_evidences: dict = defaultdict(list)
         type_retrieved: dict = defaultdict(list)
         for item in per_item:
             qtype = item["question_type"]
             type_questions[qtype].append(item["question"])
             type_preds[qtype].append(item["prediction"])
             type_gts[qtype].append(item["ground_truth"])
+            type_evidences[qtype].append(item["evidence_texts"])
             type_retrieved[qtype].append(item["retrieved_texts"])
         type_metrics = {
             t: compute_metrics(
@@ -463,6 +476,7 @@ async def run_experiment(
                 type_preds[t],
                 type_gts[t],
                 "financebench",
+                evidences=type_evidences[t],
                 retrieved_texts_list=type_retrieved[t],
             )
             for t in sorted(type_preds)
@@ -471,12 +485,14 @@ async def run_experiment(
         reasoning_preds: dict = defaultdict(list)
         reasoning_gts: dict = defaultdict(list)
         reasoning_questions: dict = defaultdict(list)
+        reasoning_evidences: dict = defaultdict(list)
         reasoning_retrieved: dict = defaultdict(list)
         for item in per_item:
             r = item["question_reasoning"]
             reasoning_preds[r].append(item["prediction"])
             reasoning_gts[r].append(item["ground_truth"])
             reasoning_questions[r].append(item["question"])
+            reasoning_evidences[r].append(item["evidence_texts"])
             reasoning_retrieved[r].append(item["retrieved_texts"])
         reasoning_metrics = {
             r: compute_metrics(
@@ -485,6 +501,7 @@ async def run_experiment(
                 reasoning_preds[r],
                 reasoning_gts[r],
                 "financebench",
+                evidences=reasoning_evidences[r],
                 retrieved_texts_list=reasoning_retrieved[r],
             )
             for r in sorted(reasoning_preds)
@@ -546,6 +563,7 @@ async def run_experiment(
     questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[str] = []
+    evidences: list[list[str]] = []
     all_retrieved: list[list[str]] = []
     per_item: list[dict] = []
     for qa, (answer, retrieved) in zip(retrieve_qa, results):
@@ -554,7 +572,13 @@ async def run_experiment(
         predictions.append(answer)
         questions.append(qa["question"])
         gt = qa["answer"]
+        ev = [
+            e["evidence_text"] for e in qa.get("evidence", []) if e.get("evidence_text")
+        ]
+        if not ev:
+            ev = [gt]
         ground_truths.append(gt)
+        evidences.append(ev)
         all_retrieved.append(retrieved)
         print(f"retrieved: {retrieved}")
         per_item.append(
@@ -566,10 +590,11 @@ async def run_experiment(
                 "question_type": qa.get("question_type", ""),
                 "question_reasoning": qa.get("question_reasoning") or "unknown",
                 "ground_truth": gt,
+                "evidence_texts": ev,
                 "prediction": answer,
                 "retrieved_texts": retrieved,
                 "f1": token_f1(answer, gt),
-                "recall": token_recall(answer, gt, retrieved_texts=retrieved),
+                "recall": token_recall(answer, ev, retrieved_texts=retrieved),
                 "accuracy": accuracy(
                     accuracy_llm, qa["question"], answer, gt, "financebench"
                 ),
@@ -587,18 +612,21 @@ async def run_experiment(
         predictions,
         ground_truths,
         "financebench",
+        evidences=evidences,
         retrieved_texts_list=all_retrieved,
     )
 
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     type_questions: dict = defaultdict(list)
+    type_evidences: dict = defaultdict(list)
     type_retrieved: dict = defaultdict(list)
     for item in per_item:
         qtype = item["question_type"]
         type_questions[qtype].append(item["question"])
         type_preds[qtype].append(item["prediction"])
         type_gts[qtype].append(item["ground_truth"])
+        type_evidences[qtype].append(item["evidence_texts"])
         type_retrieved[qtype].append(item["retrieved_texts"])
     type_metrics = {
         t: compute_metrics(
@@ -607,6 +635,7 @@ async def run_experiment(
             type_preds[t],
             type_gts[t],
             "financebench",
+            evidences=type_evidences[t],
             retrieved_texts_list=type_retrieved[t],
         )
         for t in sorted(type_preds)
@@ -615,12 +644,14 @@ async def run_experiment(
     reasoning_preds: dict = defaultdict(list)
     reasoning_gts: dict = defaultdict(list)
     reasoning_questions: dict = defaultdict(list)
+    reasoning_evidences: dict = defaultdict(list)
     reasoning_retrieved: dict = defaultdict(list)
     for item in per_item:
         r = item["question_reasoning"]
         reasoning_preds[r].append(item["prediction"])
         reasoning_gts[r].append(item["ground_truth"])
         reasoning_questions[r].append(item["question"])
+        reasoning_evidences[r].append(item["evidence_texts"])
         reasoning_retrieved[r].append(item["retrieved_texts"])
     reasoning_metrics = {
         r: compute_metrics(
@@ -629,6 +660,7 @@ async def run_experiment(
             reasoning_preds[r],
             reasoning_gts[r],
             "financebench",
+            evidences=reasoning_evidences[r],
             retrieved_texts_list=reasoning_retrieved[r],
         )
         for r in sorted(reasoning_preds)

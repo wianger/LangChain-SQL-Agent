@@ -89,10 +89,12 @@ def _load_all_data() -> List[Dict]:
 
     for item in raw_answerable:
         gold_answers: List[str] = []
+        selected_sentences: List[str] = []
         for out in item.get("output", []):
             ans = out.get("answer", "").strip()
             if ans:
                 gold_answers.append(ans)
+            selected_sentences.extend(out.get("selected_sentences", []))
         if not gold_answers:
             continue
 
@@ -102,6 +104,9 @@ def _load_all_data() -> List[Dict]:
                 "question": item["input"],
                 "passages": item.get("passages", []),
                 "gold_answers": gold_answers,
+                "evidence_texts": selected_sentences
+                if selected_sentences
+                else gold_answers,
                 "answerable": True,
             }
         )
@@ -314,19 +319,23 @@ async def run_experiment(
 
         per_item: list = []
         all_retrieved: list[list[str]] = []
+        evidences: list[list[str]] = []
         for qa, (answer, retrieved) in zip(qa_order, answers):
             golds = qa["gold_answers"]
+            ev = qa.get("evidence_texts", golds)
             all_retrieved.append(retrieved)
+            evidences.append(ev)
             per_item.append(
                 {
                     "qa_id": qa["qa_id"],
                     "question": qa["question"],
                     "answerable": qa["answerable"],
                     "ground_truth": golds,
+                    "evidence_texts": ev,
                     "prediction": answer,
                     "retrieved_texts": retrieved,
                     "f1": token_f1(answer, golds),
-                    "recall": token_recall(answer, golds, retrieved_texts=retrieved),
+                    "recall": token_recall(answer, ev, retrieved_texts=retrieved),
                     "accuracy": accuracy(
                         accuracy_llm, qa["question"], answer, golds, "clapnq"
                     ),
@@ -342,18 +351,21 @@ async def run_experiment(
             predictions,
             ground_truths,
             "clapnq",
+            evidences=evidences,
             retrieved_texts_list=all_retrieved,
         )
 
         ans_ques: dict = defaultdict(list)
         ans_preds: dict = defaultdict(list)
         ans_gts: dict = defaultdict(list)
+        ans_evidences: dict = defaultdict(list)
         ans_retrieved: dict = defaultdict(list)
         for item in per_item:
             label = "answerable" if item["answerable"] else "unanswerable"
             ans_ques[label].append(item["question"])
             ans_preds[label].append(item["prediction"])
             ans_gts[label].append(item["ground_truth"])
+            ans_evidences[label].append(item["evidence_texts"])
             ans_retrieved[label].append(item.get("retrieved_texts", []))
         split_metrics = {
             k: compute_metrics(
@@ -362,6 +374,7 @@ async def run_experiment(
                 ans_preds[k],
                 ans_gts[k],
                 "clapnq",
+                evidences=ans_evidences[k],
                 retrieved_texts_list=ans_retrieved[k],
             )
             for k in sorted(ans_preds)
@@ -425,6 +438,7 @@ async def run_experiment(
     questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[Union[str, List[str]]] = []
+    evidences: list[list[str]] = []
     all_retrieved: list[list[str]] = []
     per_item: list[dict] = []
     for qa, res in zip(retrieve_qa, results):
@@ -436,7 +450,9 @@ async def run_experiment(
         predictions.append(answer)
         questions.append(qa["question"])
         golds = qa["gold_answers"]
+        ev = qa.get("evidence_texts", golds)
         ground_truths.append(golds)
+        evidences.append(ev)
         all_retrieved.append(retrieved)
         per_item.append(
             {
@@ -444,10 +460,11 @@ async def run_experiment(
                 "question": qa["question"],
                 "answerable": qa["answerable"],
                 "ground_truth": golds,
+                "evidence_texts": ev,
                 "prediction": answer,
                 "retrieved_texts": retrieved,
                 "f1": token_f1(answer, golds),
-                "recall": token_recall(answer, golds, retrieved_texts=retrieved),
+                "recall": token_recall(answer, ev, retrieved_texts=retrieved),
                 "accuracy": accuracy(
                     accuracy_llm, qa["question"], answer, golds, "clapnq"
                 ),
@@ -464,18 +481,21 @@ async def run_experiment(
         predictions,
         ground_truths,
         "clapnq",
+        evidences=evidences,
         retrieved_texts_list=all_retrieved,
     )
 
     ans_ques: dict = defaultdict(list)
     ans_preds: dict = defaultdict(list)
     ans_gts: dict = defaultdict(list)
+    ans_evidences: dict = defaultdict(list)
     ans_retrieved: dict = defaultdict(list)
     for item in per_item:
         label = "answerable" if item["answerable"] else "unanswerable"
         ans_ques[label].append(item["question"])
         ans_preds[label].append(item["prediction"])
         ans_gts[label].append(item["ground_truth"])
+        ans_evidences[label].append(item["evidence_texts"])
         ans_retrieved[label].append(item.get("retrieved_texts", []))
     split_metrics = {
         k: compute_metrics(
@@ -484,6 +504,7 @@ async def run_experiment(
             ans_preds[k],
             ans_gts[k],
             "clapnq",
+            evidences=ans_evidences[k],
             retrieved_texts_list=ans_retrieved[k],
         )
         for k in sorted(ans_preds)

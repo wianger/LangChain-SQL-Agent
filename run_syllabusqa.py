@@ -139,7 +139,7 @@ def _load_test_qa() -> List[Dict]:
             qtype = str(item.get("question_type", "")).lower()
             if qtype == "no answer" or _is_no_answer(answer):
                 continue
-            item["evidence_texts"] = _extract_evidence(item)
+            item["evidence_texts"] = _extract_evidence(item) or [answer]
             results.append(item)
     return results
 

@@ -127,25 +127,43 @@ def _extract_qa(papers: List[Dict]) -> List[Dict]:
             annotator_answers = answers_per_q[idx]["answer"]
             gold_texts: List[str] = []
             type_counts: Dict[str, int] = defaultdict(int)
+            evidence_texts: List[str] = []
 
             for ann in annotator_answers:
                 txt, atype = _get_gold_answer(ann)
                 if txt:
                     gold_texts.append(txt)
                 type_counts[atype] += 1
+                # Collect both evidence and highlighted_evidence
+                for et in ann.get("evidence") or []:
+                    if isinstance(et, str) and et.strip():
+                        evidence_texts.append(et.strip())
+                for et in ann.get("highlighted_evidence") or []:
+                    if isinstance(et, str) and et.strip():
+                        evidence_texts.append(et.strip())
 
-            majority_type = (
-                max(type_counts, key=lambda k: type_counts[k])
-                if type_counts
-                else "unknown"
-            )
+            # Deduplicate while preserving order
+            seen: set = set()
+            unique_evidence: List[str] = []
+            for et in evidence_texts:
+                if et not in seen:
+                    seen.add(et)
+                    unique_evidence.append(et)
 
-            if not gold_texts or majority_type == "unanswerable":
-                continue
-
-            # Remove any "unanswerable" entries mixed in with real answers
+            # Remove unanswerable entries; skip only if ALL are unanswerable
             gold_texts = [t for t in gold_texts if t.lower() != "unanswerable"]
             if not gold_texts:
+                continue
+
+            majority_type = (
+                max(
+                    ((k, v) for k, v in type_counts.items() if k != "unanswerable"),
+                    key=lambda kv: kv[1],
+                )[0]
+                if any(k != "unanswerable" for k in type_counts)
+                else "unanswerable"
+            )
+            if majority_type == "unanswerable":
                 continue
 
             qa_list.append(
@@ -155,6 +173,7 @@ def _extract_qa(papers: List[Dict]) -> List[Dict]:
                     "question_id": question_ids[idx],
                     "question": questions[idx],
                     "gold_answers": gold_texts,
+                    "evidence_texts": unique_evidence if unique_evidence else gold_texts,
                     "answer_type": majority_type,
                 }
             )
@@ -383,6 +402,7 @@ async def run_experiment(
 
         per_item: list = []
         all_retrieved: list[list[str]] = []
+        evidences: list[list[str]] = []
         for pid, qa_list in qa_by_paper.items():
             _insert_paper_group(engine, papers_by_id[pid])
 
@@ -409,7 +429,9 @@ async def run_experiment(
                 answer = answer or ""
                 retrieved = retrieved or []
                 golds = qa["gold_answers"]
+                ev = qa.get("evidence_texts", golds)
                 all_retrieved.append(retrieved)
+                evidences.append(ev)
                 per_item.append(
                     {
                         "paper_id": qa["paper_id"],
@@ -417,11 +439,12 @@ async def run_experiment(
                         "question": qa["question"],
                         "answer_type": qa["answer_type"],
                         "ground_truth": golds,
+                        "evidence_texts": ev,
                         "prediction": answer,
                         "retrieved_texts": retrieved,
                         "f1": token_f1(answer, golds),
                         "recall": token_recall(
-                            answer, golds, retrieved_texts=retrieved
+                            answer, ev, retrieved_texts=retrieved
                         ),
                         "accuracy": accuracy(
                             accuracy_llm, qa["question"], answer, golds, "qasper"
@@ -440,18 +463,21 @@ async def run_experiment(
             predictions,
             ground_truths,
             "qasper",
+            evidences=evidences,
             retrieved_texts_list=all_retrieved,
         )
 
         type_preds: dict = defaultdict(list)
         type_gts: dict = defaultdict(list)
         type_questions: dict = defaultdict(list)
+        type_evidences: dict = defaultdict(list)
         type_retrieved: dict = defaultdict(list)
         for item in per_item:
             atype = item["answer_type"]
             type_questions[atype].append(item["question"])
             type_preds[atype].append(item["prediction"])
             type_gts[atype].append(item["ground_truth"])
+            type_evidences[atype].append(item["evidence_texts"])
             type_retrieved[atype].append(item["retrieved_texts"])
         type_metrics = {
             t: compute_metrics(
@@ -460,6 +486,7 @@ async def run_experiment(
                 type_preds[t],
                 type_gts[t],
                 "qasper",
+                evidences=type_evidences[t],
                 retrieved_texts_list=type_retrieved[t],
             )
             for t in sorted(type_preds)
@@ -521,6 +548,7 @@ async def run_experiment(
     questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[Union[str, List[str]]] = []
+    evidences: list[list[str]] = []
     all_retrieved: list[list[str]] = []
     per_item: list[dict] = []
     for qa, (answer, retrieved) in zip(retrieve_qa, results):
@@ -529,7 +557,9 @@ async def run_experiment(
         predictions.append(answer)
         questions.append(qa["question"])
         golds = qa["gold_answers"]
+        ev = qa.get("evidence_texts", golds)
         ground_truths.append(golds)
+        evidences.append(ev)
         all_retrieved.append(retrieved)
         per_item.append(
             {
@@ -538,10 +568,11 @@ async def run_experiment(
                 "question": qa["question"],
                 "answer_type": qa["answer_type"],
                 "ground_truth": golds,
+                "evidence_texts": ev,
                 "prediction": answer,
                 "retrieved_texts": retrieved,
                 "f1": token_f1(answer, golds),
-                "recall": token_recall(answer, golds, retrieved_texts=retrieved),
+                "recall": token_recall(answer, ev, retrieved_texts=retrieved),
                 "accuracy": accuracy(
                     accuracy_llm, qa["question"], answer, golds, "qasper"
                 ),
@@ -559,18 +590,21 @@ async def run_experiment(
         predictions,
         ground_truths,
         "qasper",
+        evidences=evidences,
         retrieved_texts_list=all_retrieved,
     )
 
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     type_questions: dict = defaultdict(list)
+    type_evidences: dict = defaultdict(list)
     type_retrieved: dict = defaultdict(list)
     for item in per_item:
         atype = item["answer_type"]
         type_questions[atype].append(item["question"])
         type_preds[atype].append(item["prediction"])
         type_gts[atype].append(item["ground_truth"])
+        type_evidences[atype].append(item["evidence_texts"])
         type_retrieved[atype].append(item["retrieved_texts"])
     type_metrics = {
         t: compute_metrics(
@@ -579,6 +613,7 @@ async def run_experiment(
             type_preds[t],
             type_gts[t],
             "qasper",
+            evidences=type_evidences[t],
             retrieved_texts_list=type_retrieved[t],
         )
         for t in sorted(type_preds)

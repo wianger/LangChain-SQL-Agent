@@ -3,7 +3,7 @@ import os
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── API ──────────────────────────────────────────────────────────────────────
-API_KEY = "d6a0fa40-09a9-49ec-9246-f0fde02b1858"
+API_KEY = "API_KEY_HERE"
 BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 MODEL_NAME = "doubao-seed-2-0-pro-260215"
 EMBEDDING_MODEL = "doubao-embedding-vision-251215"

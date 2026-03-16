@@ -124,7 +124,7 @@ def _token_recall_single(
 
 def token_recall(
     prediction: str,
-    ground_truth: Union[str, List[str]],
+    evidences: Union[str, List[str]],
     soft_threshold: float = 0.8,
     min_soft_match_tokens: int = 4,
     retrieved_texts: List[str] | None = None,
@@ -134,10 +134,10 @@ def token_recall(
     If *retrieved_texts* is provided (the raw SQL query results from the
     agent's intermediate steps), recall is computed against those.
     Otherwise falls back to using *prediction* (the agent's final answer).
-    *ground_truth* (str or list of str) is the evidence list.
+    *evidences* (str or list of str) is the evidence list.
     """
     retrieved = retrieved_texts if retrieved_texts else [prediction]
-    evidence = ground_truth if isinstance(ground_truth, list) else [ground_truth]
+    evidence = evidences if isinstance(evidences, list) else [evidences]
     return _token_recall_single(
         retrieved, evidence, soft_threshold, min_soft_match_tokens
     )

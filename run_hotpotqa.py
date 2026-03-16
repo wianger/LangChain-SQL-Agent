@@ -353,6 +353,7 @@ async def run_experiment(
         questions: list[str] = []
         predictions: list[str] = []
         ground_truths: list[Union[str, List[str]]] = []
+        evidences: list[list[str]] = []
         all_retrieved: list[list[str]] = []
         per_item: list[dict] = []
         for qa, ans in qa_answers:
@@ -364,7 +365,9 @@ async def run_experiment(
             predictions.append(answer)
             questions.append(qa["question"])
             gt = qa["answer"]
+            ev = qa["evidence_sentences"] if qa["evidence_sentences"] else [gt]
             ground_truths.append(gt)
+            evidences.append(ev)
             all_retrieved.append(retrieved)
             per_item.append(
                 {
@@ -377,7 +380,7 @@ async def run_experiment(
                     "prediction": answer,
                     "retrieved_texts": retrieved,
                     "f1": token_f1(answer, gt),
-                    "recall": token_recall(answer, gt, retrieved_texts=retrieved),
+                    "recall": token_recall(answer, ev, retrieved_texts=retrieved),
                     "accuracy": accuracy(
                         accuracy_llm, qa["question"], answer, gt, "hotpotqa"
                     ),
@@ -390,17 +393,20 @@ async def run_experiment(
             predictions,
             ground_truths,
             "hotpotqa",
+            evidences=evidences,
             retrieved_texts_list=all_retrieved,
         )
         type_preds: dict = defaultdict(list)
         type_gts: dict = defaultdict(list)
         type_questions: dict = defaultdict(list)
+        type_evidences: dict = defaultdict(list)
         type_retrieved: dict = defaultdict(list)
         for item in per_item:
             t = item["type"]
             type_preds[t].append(item["prediction"])
             type_gts[t].append(item["ground_truth"])
             type_questions[t].append(item["question"])
+            type_evidences[t].append(item["evidence_sentences"] or [item["ground_truth"]])
             type_retrieved[t].append(item.get("retrieved_texts", []))
         type_metrics = {
             t: compute_metrics(
@@ -409,6 +415,7 @@ async def run_experiment(
                 type_preds[t],
                 type_gts[t],
                 "hotpotqa",
+                evidences=type_evidences[t],
                 retrieved_texts_list=type_retrieved[t],
             )
             for t in sorted(type_preds)
@@ -472,6 +479,7 @@ async def run_experiment(
     questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[Union[str, List[str]]] = []
+    evidences: list[list[str]] = []
     all_retrieved: list[list[str]] = []
     per_item: list[dict] = []
     for qa, res in zip(retrieve_qa, results):
@@ -483,7 +491,9 @@ async def run_experiment(
         predictions.append(answer)
         questions.append(qa["question"])
         gt = qa["answer"]
+        ev = qa["evidence_sentences"] if qa["evidence_sentences"] else [gt]
         ground_truths.append(gt)
+        evidences.append(ev)
         all_retrieved.append(retrieved)
         per_item.append(
             {
@@ -496,7 +506,7 @@ async def run_experiment(
                 "prediction": answer,
                 "retrieved_texts": retrieved,
                 "f1": token_f1(answer, gt),
-                "recall": token_recall(answer, gt, retrieved_texts=retrieved),
+                "recall": token_recall(answer, ev, retrieved_texts=retrieved),
                 "accuracy": accuracy(
                     accuracy_llm, qa["question"], answer, gt, "hotpotqa"
                 ),
@@ -513,18 +523,21 @@ async def run_experiment(
         predictions,
         ground_truths,
         "hotpotqa",
+        evidences=evidences,
         retrieved_texts_list=all_retrieved,
     )
 
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     type_questions: dict = defaultdict(list)
+    type_evidences: dict = defaultdict(list)
     type_retrieved: dict = defaultdict(list)
     for item in per_item:
         t = item["type"]
         type_preds[t].append(item["prediction"])
         type_gts[t].append(item["ground_truth"])
         type_questions[t].append(item["question"])
+        type_evidences[t].append(item["evidence_sentences"] or [item["ground_truth"]])
         type_retrieved[t].append(item.get("retrieved_texts", []))
     type_metrics = {
         t: compute_metrics(
@@ -533,6 +546,7 @@ async def run_experiment(
             type_preds[t],
             type_gts[t],
             "hotpotqa",
+            evidences=type_evidences[t],
             retrieved_texts_list=type_retrieved[t],
         )
         for t in sorted(type_preds)
