@@ -133,8 +133,12 @@ def _build_dia_id_map(entry: Dict) -> Dict[str, str]:
 
 
 NO_ANSWER_PATTERNS = [
-    "no answer", "unanswerable", "no/insufficient information",
-    "not mentioned", "none", "n/a",
+    "no answer",
+    "unanswerable",
+    "no/insufficient information",
+    "not mentioned",
+    "none",
+    "n/a",
 ]
 
 
@@ -162,9 +166,7 @@ def _extract_qa(data: List[Dict]) -> List[Dict]:
                 continue
 
             evidence_refs = qa.get("evidence", [])
-            evidence_texts = [
-                dia_map[ref] for ref in evidence_refs if ref in dia_map
-            ]
+            evidence_texts = [dia_map[ref] for ref in evidence_refs if ref in dia_map]
 
             qa_list.append(
                 {
@@ -197,7 +199,7 @@ def _init_db(db_path: str) -> None:
     engine.dispose()
 
 
-def _bulk_insert(db_path: str, data: List[Dict]) -> float:
+def _bulk_insert(db_path, data: List[Dict]) -> float:
     conv_rows, summary_rows, obs_rows = _extract_rows(data)
     engine = create_engine(f"sqlite:///{db_path}")
     t0 = time.time()
@@ -249,24 +251,18 @@ def _bulk_insert(db_path: str, data: List[Dict]) -> float:
     return elapsed
 
 
-# ── Async helpers ────────────────────────────────────────────────────────────
-
-
-async def _run_concurrent(coros: list, desc: str) -> list:
-    """Run coroutines concurrently with a tqdm progress bar."""
-    pbar = tqdm(total=len(coros), desc=desc)
-    results: list = [None] * len(coros)
-
-    async def _wrap(idx: int, coro):
-        results[idx] = await coro
-        pbar.update(1)
-
-    await asyncio.gather(*[_wrap(i, c) for i, c in enumerate(coros)])
-    pbar.close()
-    return results
-
-
-# ── Experiment runner ────────────────────────────────────────────────────────
+def _bulk_delete(db_path) -> float:
+    engine = create_engine(f"sqlite:///{db_path}")
+    t0 = time.time()
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM conversations"))
+        conn.execute(text("DELETE FROM session_summaries"))
+        conn.execute(text("DELETE FROM observations"))
+        conn.commit()
+    elapsed = time.time() - t0
+    engine.dispose()
+    logger.info("Bulk delete completed in %.2fs", elapsed)
+    return elapsed
 
 
 def _insert_sample(engine, entry: Dict) -> None:
@@ -280,7 +276,15 @@ def _insert_sample(engine, entry: Dict) -> None:
                     "(sample_id, session_id, session_date, turn_number, dia_id, speaker, text) "
                     "VALUES (:a,:b,:c,:d,:e,:f,:g)"
                 ),
-                {"a": r[0], "b": r[1], "c": r[2], "d": r[3], "e": r[4], "f": r[5], "g": r[6]},
+                {
+                    "a": r[0],
+                    "b": r[1],
+                    "c": r[2],
+                    "d": r[3],
+                    "e": r[4],
+                    "f": r[5],
+                    "g": r[6],
+                },
             )
         for r in summary_rows:
             conn.execute(
@@ -304,10 +308,36 @@ def _insert_sample(engine, entry: Dict) -> None:
 
 def _delete_sample(engine, sample_id: str) -> None:
     with engine.connect() as conn:
-        conn.execute(text("DELETE FROM conversations WHERE sample_id = :s"), {"s": sample_id})
-        conn.execute(text("DELETE FROM session_summaries WHERE sample_id = :s"), {"s": sample_id})
-        conn.execute(text("DELETE FROM observations WHERE sample_id = :s"), {"s": sample_id})
+        conn.execute(
+            text("DELETE FROM conversations WHERE sample_id = :s"), {"s": sample_id}
+        )
+        conn.execute(
+            text("DELETE FROM session_summaries WHERE sample_id = :s"), {"s": sample_id}
+        )
+        conn.execute(
+            text("DELETE FROM observations WHERE sample_id = :s"), {"s": sample_id}
+        )
         conn.commit()
+
+
+# ── Async helpers ────────────────────────────────────────────────────────────
+
+
+async def _run_concurrent(coros: list, desc: str) -> list:
+    """Run coroutines concurrently with a tqdm progress bar."""
+    pbar = tqdm(total=len(coros), desc=desc)
+    results: list = [None] * len(coros)
+
+    async def _wrap(idx: int, coro):
+        results[idx] = await coro
+        pbar.update(1)
+
+    await asyncio.gather(*[_wrap(i, c) for i, c in enumerate(coros)])
+    pbar.close()
+    return results
+
+
+# ── Experiment runner ────────────────────────────────────────────────────────
 
 
 async def run_experiment(
@@ -384,23 +414,30 @@ async def run_experiment(
         questions: list[str] = []
         ground_truths: list[str] = []
         evidences: list[list[str]] = []
+        all_retrieved: list[list[str]] = []
         per_item: list[dict] = []
-        for qa, answer in qa_answers:
+        for qa, (answer, retrieved) in qa_answers:
             answer = answer or ""
             predictions.append(answer)
             questions.append(qa["question"])
             ground_truths.append(qa["answer"])
             ev = qa.get("evidence_texts", [])
             evidences.append(ev if ev else [qa["answer"]])
+            all_retrieved.append(retrieved)
             per_item.append(
                 {
                     "question": qa["question"],
                     "ground_truth": qa["answer"],
                     "evidence_texts": ev,
                     "prediction": answer,
+                    "retrieved_texts": retrieved,
                     "category": qa["category"],
                     "f1": token_f1(answer, qa["answer"]),
-                    "recall": token_recall(answer, ev if ev else [qa["answer"]]),
+                    "recall": token_recall(
+                        answer,
+                        ev if ev else [qa["answer"]],
+                        retrieved_texts=retrieved,
+                    ),
                     "accuracy": accuracy(
                         accuracy_llm, qa["question"], answer, qa["answer"], "Locomo"
                     ),
@@ -408,13 +445,19 @@ async def run_experiment(
             )
 
         qa_metrics = compute_metrics(
-            accuracy_llm, questions, predictions, ground_truths, "Locomo",
+            accuracy_llm,
+            questions,
+            predictions,
+            ground_truths,
+            "Locomo",
             evidences=evidences,
+            retrieved_texts_list=all_retrieved,
         )
         cat_preds: dict = defaultdict(list)
         cat_gts: dict = defaultdict(list)
         cat_questions: dict = defaultdict(list)
         cat_evidences: dict = defaultdict(list)
+        cat_retrieved: dict = defaultdict(list)
         for item in per_item:
             c = item["category"]
             cat_preds[c].append(item["prediction"])
@@ -422,14 +465,19 @@ async def run_experiment(
             cat_questions[c].append(item["question"])
             ev = item.get("evidence_texts", [])
             cat_evidences[c].append(ev if ev else [item["ground_truth"]])
+            cat_retrieved[c].append(item.get("retrieved_texts", []))
         cat_metrics = {
             config.LOCOMO_CATEGORIES.get(c, str(c)): compute_metrics(
-                accuracy_llm, cat_questions[c], cat_preds[c], cat_gts[c],
-                "Locomo", evidences=cat_evidences[c],
+                accuracy_llm,
+                cat_questions[c],
+                cat_preds[c],
+                cat_gts[c],
+                "Locomo",
+                evidences=cat_evidences[c],
+                retrieved_texts_list=cat_retrieved[c],
             )
             for c in sorted(cat_preds)
         }
-
         report = {
             "dataset": "LoCoMo",
             "mode": "per-question",
@@ -446,40 +494,14 @@ async def run_experiment(
         }
         _print_report(report)
         return report
-    bulk_time = _bulk_insert(db_path, data)
 
+    bulk_insert_time = _bulk_insert(db_path, data)
     tracker = TokenTracker(config.TIKTOKEN_ENCODING)
     op = OperationTracker(tracker)
     agent = build_agent(db_path, tracker, verbose=verbose)
-
     rng = random.Random(42)
     retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
-
-    conv_rows, _, _ = _extract_rows(data)
-    insert_sample = rng.sample(conv_rows, min(sample_size, len(conv_rows)))
-    delete_sample_ids = [r[4] for r in insert_sample[:sample_size]]
-
     sem = asyncio.Semaphore(config.CONCURRENCY)
-
-    # ── INSERT ──────────────────────────────────────────────────────────────
-    print(
-        "\n[INSERT] %d records (concurrency=%d)..."
-        % (len(insert_sample), config.CONCURRENCY)
-    )
-
-    async def _do_insert(row):
-        prompt = (
-            f"Insert a new record into the conversations table with: "
-            f"sample_id='{row[0]}', session_id={row[1]}, "
-            f"session_date='{row[2]}', turn_number={row[3]}, "
-            f"dia_id='{row[4]}_dup', speaker='{row[5]}', "
-            f"text='{row[6][:200]}'"
-        )
-        async with sem:
-            with op.track("insert"):
-                await arun_agent(agent, prompt)
-
-    await _run_concurrent([_do_insert(r) for r in insert_sample], "insert")
 
     # ── RETRIEVE ────────────────────────────────────────────────────────────
     print(
@@ -507,23 +529,30 @@ async def run_experiment(
     questions: list[str] = []
     ground_truths: list[str] = []
     evidences: list[list[str]] = []
+    all_retrieved: list[list[str]] = []
     per_item: list[dict] = []
-    for qa, answer in zip(retrieve_qa, answers):
+    for qa, (answer, retrieved) in zip(retrieve_qa, answers):
         answer = answer or ""
         predictions.append(answer)
         questions.append(qa["question"])
         ground_truths.append(qa["answer"])
         ev = qa.get("evidence_texts", [])
         evidences.append(ev if ev else [qa["answer"]])
+        all_retrieved.append(retrieved)
         per_item.append(
             {
                 "question": qa["question"],
                 "ground_truth": qa["answer"],
                 "evidence_texts": ev,
                 "prediction": answer,
+                "retrieved_texts": retrieved,
                 "category": qa["category"],
                 "f1": token_f1(answer, qa["answer"]),
-                "recall": token_recall(answer, ev if ev else [qa["answer"]]),
+                "recall": token_recall(
+                    answer,
+                    ev if ev else [qa["answer"]],
+                    retrieved_texts=retrieved,
+                ),
                 "accuracy": accuracy(
                     accuracy_llm, qa["question"], answer, qa["answer"], "Locomo"
                 ),
@@ -531,29 +560,24 @@ async def run_experiment(
         )
 
     # ── DELETE ──────────────────────────────────────────────────────────────
-    print(
-        "\n[DELETE] %d records (concurrency=%d)..."
-        % (len(delete_sample_ids), config.CONCURRENCY)
-    )
-
-    async def _do_delete(dia_id):
-        prompt = f"Delete the record from conversations where dia_id = '{dia_id}_dup'."
-        async with sem:
-            with op.track("delete"):
-                await arun_agent(agent, prompt)
-
-    await _run_concurrent([_do_delete(d) for d in delete_sample_ids], "delete")
+    bulk_delete_time = _bulk_delete(db_path)
 
     # ── Metrics ─────────────────────────────────────────────────────────────
     qa_metrics = compute_metrics(
-        accuracy_llm, questions, predictions, ground_truths, "Locomo",
+        accuracy_llm,
+        questions,
+        predictions,
+        ground_truths,
+        "Locomo",
         evidences=evidences,
+        retrieved_texts_list=all_retrieved,
     )
 
     cat_preds: dict = defaultdict(list)
     cat_gts: dict = defaultdict(list)
     cat_questions: dict = defaultdict(list)
     cat_evidences: dict = defaultdict(list)
+    cat_retrieved: dict = defaultdict(list)
     for item in per_item:
         cat = item["category"]
         cat_preds[cat].append(item["prediction"])
@@ -561,10 +585,16 @@ async def run_experiment(
         cat_questions[cat].append(item["question"])
         ev = item.get("evidence_texts", [])
         cat_evidences[cat].append(ev if ev else [item["ground_truth"]])
+        cat_retrieved[cat].append(item.get("retrieved_texts", []))
     cat_metrics = {
         config.LOCOMO_CATEGORIES.get(cat, str(cat)): compute_metrics(
-            accuracy_llm, cat_questions[cat], cat_preds[cat], cat_gts[cat],
-            "Locomo", evidences=cat_evidences[cat],
+            accuracy_llm,
+            cat_questions[cat],
+            cat_preds[cat],
+            cat_gts[cat],
+            "Locomo",
+            evidences=cat_evidences[cat],
+            retrieved_texts_list=cat_retrieved[cat],
         )
         for cat in sorted(cat_preds)
     }
@@ -574,9 +604,8 @@ async def run_experiment(
         "sample_size": sample_size,
         "concurrency": config.CONCURRENCY,
         "num_retrieve": len(retrieve_qa),
-        "num_insert": len(insert_sample),
-        "num_delete": len(delete_sample_ids),
-        "bulk_insert_time": bulk_time,
+        "bulk_insert_time": bulk_insert_time,
+        "bulk_delete_time": bulk_delete_time,
         "qa_metrics": qa_metrics,
         "qa_metrics_by_category": cat_metrics,
         "insert_metrics": op.summary("insert"),
@@ -605,6 +634,8 @@ def _print_report(r: Dict) -> None:
     print()
     if "bulk_insert_time" in r:
         print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+    if "bulk_delete_time" in r:
+        print(f"  Bulk delete time: {r['bulk_delete_time']:.2f}s")
     if "setup_time" in r:
         print(
             f"  Doc groups: {r['num_doc_groups']}  "

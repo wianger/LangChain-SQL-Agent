@@ -262,12 +262,33 @@ def _bulk_insert(db_path: str, papers: List[Dict]) -> float:
     return elapsed
 
 
+def _bulk_delete(db_path: str) -> float:
+    engine = create_engine(f"sqlite:///{db_path}")
+    t0 = time.time()
+
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM section_chunks"))
+        conn.execute(text("DELETE FROM sections"))
+        conn.execute(text("DELETE FROM papers"))
+        conn.commit()
+
+    elapsed = time.time() - t0
+    engine.dispose()
+    logger.info(
+        "Bulk delete: all records in %.2fs",
+        elapsed,
+    )
+    return elapsed
+
+
 def _insert_paper_group(engine, paper: Dict) -> None:
     """Insert one paper + sections + chunks for per-question mode."""
     pid = paper["id"]
     with engine.connect() as conn:
         conn.execute(
-            text("INSERT OR IGNORE INTO papers (paper_id, title, abstract) VALUES (:a, :b, :c)"),
+            text(
+                "INSERT OR IGNORE INTO papers (paper_id, title, abstract) VALUES (:a, :b, :c)"
+            ),
             {"a": pid, "b": paper.get("title", ""), "c": paper.get("abstract", "")},
         )
         for sec in _build_sections(paper):
@@ -276,7 +297,12 @@ def _insert_paper_group(engine, paper: Dict) -> None:
                     "INSERT INTO sections (paper_id, section_index, section_name, content) "
                     "VALUES (:a, :b, :c, :d)"
                 ),
-                {"a": pid, "b": sec["section_index"], "c": sec["section_name"], "d": sec["content"]},
+                {
+                    "a": pid,
+                    "b": sec["section_index"],
+                    "c": sec["section_name"],
+                    "d": sec["content"],
+                },
             )
             for ci, chunk in enumerate(_chunk_text(sec["content"])):
                 conn.execute(
@@ -294,7 +320,9 @@ def _delete_paper_group(engine, paper_id: str) -> None:
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM papers WHERE paper_id = :p"), {"p": paper_id})
         conn.execute(text("DELETE FROM sections WHERE paper_id = :p"), {"p": paper_id})
-        conn.execute(text("DELETE FROM section_chunks WHERE paper_id = :p"), {"p": paper_id})
+        conn.execute(
+            text("DELETE FROM section_chunks WHERE paper_id = :p"), {"p": paper_id}
+        )
         conn.commit()
 
 
@@ -354,6 +382,7 @@ async def run_experiment(
             qa_by_paper[qa["paper_id"]].append(qa)
 
         per_item: list = []
+        all_retrieved: list[list[str]] = []
         for pid, qa_list in qa_by_paper.items():
             _insert_paper_group(engine, papers_by_id[pid])
 
@@ -376,9 +405,11 @@ async def run_experiment(
 
             _delete_paper_group(engine, pid)
 
-            for qa, answer in zip(qa_list, answers):
+            for qa, (answer, retrieved) in zip(qa_list, answers):
                 answer = answer or ""
+                retrieved = retrieved or []
                 golds = qa["gold_answers"]
+                all_retrieved.append(retrieved)
                 per_item.append(
                     {
                         "paper_id": qa["paper_id"],
@@ -387,8 +418,11 @@ async def run_experiment(
                         "answer_type": qa["answer_type"],
                         "ground_truth": golds,
                         "prediction": answer,
+                        "retrieved_texts": retrieved,
                         "f1": token_f1(answer, golds),
-                        "recall": token_recall(answer, golds),
+                        "recall": token_recall(
+                            answer, golds, retrieved_texts=retrieved
+                        ),
                         "accuracy": accuracy(
                             accuracy_llm, qa["question"], answer, golds, "qasper"
                         ),
@@ -401,20 +435,32 @@ async def run_experiment(
         predictions = [item["prediction"] for item in per_item]
         ground_truths = [item["ground_truth"] for item in per_item]
         qa_metrics = compute_metrics(
-            accuracy_llm, questions, predictions, ground_truths, "qasper"
+            accuracy_llm,
+            questions,
+            predictions,
+            ground_truths,
+            "qasper",
+            retrieved_texts_list=all_retrieved,
         )
 
         type_preds: dict = defaultdict(list)
         type_gts: dict = defaultdict(list)
         type_questions: dict = defaultdict(list)
+        type_retrieved: dict = defaultdict(list)
         for item in per_item:
             atype = item["answer_type"]
             type_questions[atype].append(item["question"])
             type_preds[atype].append(item["prediction"])
             type_gts[atype].append(item["ground_truth"])
+            type_retrieved[atype].append(item["retrieved_texts"])
         type_metrics = {
             t: compute_metrics(
-                accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "qasper"
+                accuracy_llm,
+                type_questions[t],
+                type_preds[t],
+                type_gts[t],
+                "qasper",
+                retrieved_texts_list=type_retrieved[t],
             )
             for t in sorted(type_preds)
         }
@@ -446,28 +492,7 @@ async def run_experiment(
     rng = random.Random(42)
     retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
 
-    paper_ids = list({q["paper_id"] for q in all_qa})
-    insert_papers = rng.sample(paper_ids, min(sample_size, len(paper_ids)))
-
     sem = asyncio.Semaphore(config.CONCURRENCY)
-
-    # ── INSERT ──────────────────────────────────────────────────────────────
-    print(
-        "\n[INSERT] %d records (concurrency=%d)..."
-        % (len(insert_papers), config.CONCURRENCY)
-    )
-
-    async def _do_insert(pid):
-        prompt = (
-            f"Insert a new record into the section_chunks table with: "
-            f"paper_id='{pid}', section_index=9999, chunk_index=0, "
-            f"content='[test insert placeholder for {pid}]'"
-        )
-        async with sem:
-            with op.track("insert"):
-                await arun_agent(agent, prompt)
-
-    await _run_concurrent([_do_insert(p) for p in insert_papers], "insert")
 
     # ── RETRIEVE ────────────────────────────────────────────────────────────
     print(
@@ -488,7 +513,7 @@ async def run_experiment(
             with op.track("retrieve"):
                 return await arun_agent(agent, prompt)
 
-    answers = await _run_concurrent(
+    results = await _run_concurrent(
         [_do_retrieve(qa) for qa in retrieve_qa], "retrieve"
     )
 
@@ -496,13 +521,16 @@ async def run_experiment(
     questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[Union[str, List[str]]] = []
+    all_retrieved: list[list[str]] = []
     per_item: list[dict] = []
-    for qa, answer in zip(retrieve_qa, answers):
+    for qa, (answer, retrieved) in zip(retrieve_qa, results):
         answer = answer or ""
+        retrieved = retrieved or []
         predictions.append(answer)
         questions.append(qa["question"])
         golds = qa["gold_answers"]
         ground_truths.append(golds)
+        all_retrieved.append(retrieved)
         per_item.append(
             {
                 "paper_id": qa["paper_id"],
@@ -511,8 +539,9 @@ async def run_experiment(
                 "answer_type": qa["answer_type"],
                 "ground_truth": golds,
                 "prediction": answer,
+                "retrieved_texts": retrieved,
                 "f1": token_f1(answer, golds),
-                "recall": token_recall(answer, golds),
+                "recall": token_recall(answer, golds, retrieved_texts=retrieved),
                 "accuracy": accuracy(
                     accuracy_llm, qa["question"], answer, golds, "qasper"
                 ),
@@ -520,40 +549,37 @@ async def run_experiment(
         )
 
     # ── DELETE ──────────────────────────────────────────────────────────────
-    print(
-        "\n[DELETE] %d records (concurrency=%d)..."
-        % (len(insert_papers), config.CONCURRENCY)
-    )
-
-    async def _do_delete(pid):
-        prompt = (
-            f"Delete the record from section_chunks where "
-            f"paper_id = '{pid}' AND section_index = 9999."
-        )
-        async with sem:
-            with op.track("delete"):
-                await arun_agent(agent, prompt)
-
-    await _run_concurrent([_do_delete(p) for p in insert_papers], "delete")
+    bulk_delete_time = _bulk_delete(db_path)
 
     # ── Metrics ─────────────────────────────────────────────────────────────
     questions = [q["question"] for q in retrieve_qa]
     qa_metrics = compute_metrics(
-        accuracy_llm, questions, predictions, ground_truths, "qasper"
+        accuracy_llm,
+        questions,
+        predictions,
+        ground_truths,
+        "qasper",
+        retrieved_texts_list=all_retrieved,
     )
 
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     type_questions: dict = defaultdict(list)
+    type_retrieved: dict = defaultdict(list)
     for item in per_item:
         atype = item["answer_type"]
         type_questions[atype].append(item["question"])
         type_preds[atype].append(item["prediction"])
         type_gts[atype].append(item["ground_truth"])
-        type_questions[atype].append(item["question"])
+        type_retrieved[atype].append(item["retrieved_texts"])
     type_metrics = {
         t: compute_metrics(
-            accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "qasper"
+            accuracy_llm,
+            type_questions[t],
+            type_preds[t],
+            type_gts[t],
+            "qasper",
+            retrieved_texts_list=type_retrieved[t],
         )
         for t in sorted(type_preds)
     }
@@ -566,9 +592,8 @@ async def run_experiment(
         "num_papers": len(papers),
         "num_qa_total": len(all_qa),
         "num_retrieve": len(retrieve_qa),
-        "num_insert": len(insert_papers),
-        "num_delete": len(insert_papers),
         "bulk_insert_time": bulk_time,
+        "bulk_delete_time": bulk_delete_time,
         "qa_metrics": qa_metrics,
         "qa_metrics_by_answer_type": type_metrics,
         "insert_metrics": op.summary("insert"),
@@ -599,6 +624,8 @@ def _print_report(r: Dict) -> None:
 
     if r.get("mode") == "bulk" and "bulk_insert_time" in r:
         print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+    if r.get("mode") == "bulk" and "bulk_delete_time" in r:
+        print(f"  Bulk delete time: {r['bulk_delete_time']:.2f}s")
 
     for op_name in ("insert", "retrieve", "delete"):
         m = r.get(f"{op_name}_metrics", {})

@@ -254,6 +254,20 @@ def _bulk_insert(db_path: str, qa_data: List[Dict]) -> float:
     return elapsed
 
 
+def _bulk_delete(db_path: str) -> float:
+    """Delete all documents and chunks from SQLite."""
+    engine = create_engine(f"sqlite:///{db_path}")
+    t0 = time.time()
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM documents"))
+        conn.execute(text("DELETE FROM document_chunks"))
+        conn.commit()
+    elapsed = time.time() - t0
+    engine.dispose()
+    logger.info("Bulk delete: all documents and chunks deleted in %.2fs", elapsed)
+    return elapsed
+
+
 def _insert_doc_group(engine, doc_name: str, doc_info: Dict, pdf_dir: str) -> None:
     """Insert one document + chunks for per-question mode."""
     pdf_path = os.path.join(pdf_dir, doc_name + ".pdf")
@@ -270,9 +284,13 @@ def _insert_doc_group(engine, doc_name: str, doc_info: Dict, pdf_dir: str) -> No
                 "VALUES (:a,:b,:c,:d,:e,:f,:g)"
             ),
             {
-                "a": doc_name, "b": meta.get("company", ""),
-                "c": meta.get("gics_sector", ""), "d": meta.get("doc_type", ""),
-                "e": meta.get("doc_period", 0), "f": 0, "g": full_text,
+                "a": doc_name,
+                "b": meta.get("company", ""),
+                "c": meta.get("gics_sector", ""),
+                "d": meta.get("doc_type", ""),
+                "e": meta.get("doc_period", 0),
+                "f": 0,
+                "g": full_text,
             },
         )
         for chunk in _chunk_text(full_text):
@@ -282,7 +300,12 @@ def _insert_doc_group(engine, doc_name: str, doc_info: Dict, pdf_dir: str) -> No
                     "(doc_name, chunk_index, page_num, content) "
                     "VALUES (:a,:b,:c,:d)"
                 ),
-                {"a": doc_name, "b": chunk["chunk_index"], "c": chunk["page_num"], "d": chunk["content"]},
+                {
+                    "a": doc_name,
+                    "b": chunk["chunk_index"],
+                    "c": chunk["page_num"],
+                    "d": chunk["content"],
+                },
             )
         conn.commit()
 
@@ -290,7 +313,9 @@ def _insert_doc_group(engine, doc_name: str, doc_info: Dict, pdf_dir: str) -> No
 def _delete_doc_group(engine, doc_name: str) -> None:
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM documents WHERE doc_name = :d"), {"d": doc_name})
-        conn.execute(text("DELETE FROM document_chunks WHERE doc_name = :d"), {"d": doc_name})
+        conn.execute(
+            text("DELETE FROM document_chunks WHERE doc_name = :d"), {"d": doc_name}
+        )
         conn.commit()
 
 
@@ -349,7 +374,7 @@ async def run_experiment(
 
         setup_time = 0.0
         teardown_time = 0.0
-        answers_by_qa: Dict[tuple, str] = {}
+        answers_by_qa: Dict[tuple, tuple] = {}
 
         for doc_name, qa_list in qa_by_doc.items():
             t0 = time.time()
@@ -372,9 +397,9 @@ async def run_experiment(
             results = await _run_concurrent(
                 [_do_retrieve(qa) for qa in qa_list], f"retrieve {doc_name}"
             )
-            for qa, ans in zip(qa_list, results):
+            for qa, (answer, retrieved) in zip(qa_list, results):
                 key = (qa["financebench_id"], qa["question"])
-                answers_by_qa[key] = ans or ""
+                answers_by_qa[key] = (answer or "", retrieved or [])
 
             t1 = time.time()
             _delete_doc_group(engine, doc_name)
@@ -383,10 +408,12 @@ async def run_experiment(
         engine.dispose()
 
         per_item: list = []
+        all_retrieved: list[list[str]] = []
         for qa in retrieve_qa:
             key = (qa["financebench_id"], qa["question"])
-            answer = answers_by_qa.get(key, "")
+            answer, retrieved = answers_by_qa.get(key, ("", []))
             gt = qa["answer"]
+            all_retrieved.append(retrieved)
             per_item.append(
                 {
                     "financebench_id": qa["financebench_id"],
@@ -397,8 +424,9 @@ async def run_experiment(
                     "question_reasoning": qa.get("question_reasoning") or "unknown",
                     "ground_truth": gt,
                     "prediction": answer,
+                    "retrieved_texts": retrieved,
                     "f1": token_f1(answer, gt),
-                    "recall": token_recall(answer, gt),
+                    "recall": token_recall(answer, gt, retrieved_texts=retrieved),
                     "accuracy": accuracy(
                         accuracy_llm, qa["question"], answer, gt, "financebench"
                     ),
@@ -410,20 +438,32 @@ async def run_experiment(
         questions = [p["question"] for p in per_item]
 
         qa_metrics = compute_metrics(
-            accuracy_llm, questions, predictions, ground_truths, "financebench"
+            accuracy_llm,
+            questions,
+            predictions,
+            ground_truths,
+            "financebench",
+            retrieved_texts_list=all_retrieved,
         )
 
         type_preds: dict = defaultdict(list)
         type_gts: dict = defaultdict(list)
         type_questions: dict = defaultdict(list)
+        type_retrieved: dict = defaultdict(list)
         for item in per_item:
             qtype = item["question_type"]
             type_questions[qtype].append(item["question"])
             type_preds[qtype].append(item["prediction"])
             type_gts[qtype].append(item["ground_truth"])
+            type_retrieved[qtype].append(item["retrieved_texts"])
         type_metrics = {
             t: compute_metrics(
-                accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "financebench"
+                accuracy_llm,
+                type_questions[t],
+                type_preds[t],
+                type_gts[t],
+                "financebench",
+                retrieved_texts_list=type_retrieved[t],
             )
             for t in sorted(type_preds)
         }
@@ -431,11 +471,13 @@ async def run_experiment(
         reasoning_preds: dict = defaultdict(list)
         reasoning_gts: dict = defaultdict(list)
         reasoning_questions: dict = defaultdict(list)
+        reasoning_retrieved: dict = defaultdict(list)
         for item in per_item:
             r = item["question_reasoning"]
             reasoning_preds[r].append(item["prediction"])
             reasoning_gts[r].append(item["ground_truth"])
             reasoning_questions[r].append(item["question"])
+            reasoning_retrieved[r].append(item["retrieved_texts"])
         reasoning_metrics = {
             r: compute_metrics(
                 accuracy_llm,
@@ -443,6 +485,7 @@ async def run_experiment(
                 reasoning_preds[r],
                 reasoning_gts[r],
                 "financebench",
+                retrieved_texts_list=reasoning_retrieved[r],
             )
             for r in sorted(reasoning_preds)
         }
@@ -474,29 +517,7 @@ async def run_experiment(
 
     rng = random.Random(42)
     retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
-
-    doc_names = list({q["doc_name"] for q in all_qa})
-    insert_docs = rng.sample(doc_names, min(sample_size, len(doc_names)))
-
     sem = asyncio.Semaphore(config.CONCURRENCY)
-
-    # ── INSERT ──────────────────────────────────────────────────────────────
-    print(
-        "\n[INSERT] %d records (concurrency=%d)..."
-        % (len(insert_docs), config.CONCURRENCY)
-    )
-
-    async def _do_insert(doc_name):
-        prompt = (
-            f"Insert a new record into the document_chunks table with: "
-            f"doc_name='{doc_name}', chunk_index=9999, page_num=0, "
-            f"content='[test insert placeholder for {doc_name}]'"
-        )
-        async with sem:
-            with op.track("insert"):
-                await arun_agent(agent, prompt)
-
-    await _run_concurrent([_do_insert(d) for d in insert_docs], "insert")
 
     # ── RETRIEVE ────────────────────────────────────────────────────────────
     print(
@@ -517,7 +538,7 @@ async def run_experiment(
             with op.track("retrieve"):
                 return await arun_agent(agent, prompt)
 
-    answers = await _run_concurrent(
+    results = await _run_concurrent(
         [_do_retrieve(qa) for qa in retrieve_qa], "retrieve"
     )
 
@@ -525,13 +546,17 @@ async def run_experiment(
     questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[str] = []
+    all_retrieved: list[list[str]] = []
     per_item: list[dict] = []
-    for qa, answer in zip(retrieve_qa, answers):
+    for qa, (answer, retrieved) in zip(retrieve_qa, results):
         answer = answer or ""
+        retrieved = retrieved or []
         predictions.append(answer)
         questions.append(qa["question"])
         gt = qa["answer"]
         ground_truths.append(gt)
+        all_retrieved.append(retrieved)
+        print(f"retrieved: {retrieved}")
         per_item.append(
             {
                 "financebench_id": qa["financebench_id"],
@@ -542,8 +567,9 @@ async def run_experiment(
                 "question_reasoning": qa.get("question_reasoning") or "unknown",
                 "ground_truth": gt,
                 "prediction": answer,
+                "retrieved_texts": retrieved,
                 "f1": token_f1(answer, gt),
-                "recall": token_recall(answer, gt),
+                "recall": token_recall(answer, gt, retrieved_texts=retrieved),
                 "accuracy": accuracy(
                     accuracy_llm, qa["question"], answer, gt, "financebench"
                 ),
@@ -551,40 +577,37 @@ async def run_experiment(
         )
 
     # ── DELETE ──────────────────────────────────────────────────────────────
-    print(
-        "\n[DELETE] %d records (concurrency=%d)..."
-        % (len(insert_docs), config.CONCURRENCY)
-    )
-
-    async def _do_delete(doc_name):
-        prompt = (
-            f"Delete the record from document_chunks where "
-            f"doc_name = '{doc_name}' AND chunk_index = 9999."
-        )
-        async with sem:
-            with op.track("delete"):
-                await arun_agent(agent, prompt)
-
-    await _run_concurrent([_do_delete(d) for d in insert_docs], "delete")
+    builk_delete_time = _bulk_delete(db_path)
 
     # ── Metrics ─────────────────────────────────────────────────────────────
     questions = [q["question"] for q in retrieve_qa]
     qa_metrics = compute_metrics(
-        accuracy_llm, questions, predictions, ground_truths, "financebench"
+        accuracy_llm,
+        questions,
+        predictions,
+        ground_truths,
+        "financebench",
+        retrieved_texts_list=all_retrieved,
     )
 
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     type_questions: dict = defaultdict(list)
+    type_retrieved: dict = defaultdict(list)
     for item in per_item:
         qtype = item["question_type"]
         type_questions[qtype].append(item["question"])
         type_preds[qtype].append(item["prediction"])
         type_gts[qtype].append(item["ground_truth"])
-        type_questions[qtype].append(item["question"])
+        type_retrieved[qtype].append(item["retrieved_texts"])
     type_metrics = {
         t: compute_metrics(
-            accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "financebench"
+            accuracy_llm,
+            type_questions[t],
+            type_preds[t],
+            type_gts[t],
+            "financebench",
+            retrieved_texts_list=type_retrieved[t],
         )
         for t in sorted(type_preds)
     }
@@ -592,11 +615,13 @@ async def run_experiment(
     reasoning_preds: dict = defaultdict(list)
     reasoning_gts: dict = defaultdict(list)
     reasoning_questions: dict = defaultdict(list)
+    reasoning_retrieved: dict = defaultdict(list)
     for item in per_item:
         r = item["question_reasoning"]
         reasoning_preds[r].append(item["prediction"])
         reasoning_gts[r].append(item["ground_truth"])
         reasoning_questions[r].append(item["question"])
+        reasoning_retrieved[r].append(item["retrieved_texts"])
     reasoning_metrics = {
         r: compute_metrics(
             accuracy_llm,
@@ -604,6 +629,7 @@ async def run_experiment(
             reasoning_preds[r],
             reasoning_gts[r],
             "financebench",
+            retrieved_texts_list=reasoning_retrieved[r],
         )
         for r in sorted(reasoning_preds)
     }
@@ -613,9 +639,8 @@ async def run_experiment(
         "sample_size": sample_size,
         "concurrency": config.CONCURRENCY,
         "num_retrieve": len(retrieve_qa),
-        "num_insert": len(insert_docs),
-        "num_delete": len(insert_docs),
         "bulk_insert_time": bulk_time,
+        "bulk_delete_time": builk_delete_time,
         "qa_metrics": qa_metrics,
         "qa_metrics_by_type": type_metrics,
         "qa_metrics_by_reasoning": reasoning_metrics,
@@ -651,6 +676,7 @@ def _print_report(r: Dict) -> None:
     print()
     if mode == "bulk":
         print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+        print(f"  Bulk delete time: {r['bulk_delete_time']:.2f}s")
     else:
         print(f"  Setup time: {r['setup_time']:.2f}s")
         print(f"  Teardown time: {r['teardown_time']:.2f}s")

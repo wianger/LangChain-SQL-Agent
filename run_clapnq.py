@@ -183,6 +183,19 @@ def _bulk_insert(db_path: str, qa_data: List[Dict]) -> float:
     return elapsed
 
 
+def _bulk_delete(db_path: str) -> float:
+    engine = create_engine(f"sqlite:///{db_path}")
+    t0 = time.time()
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM passages"))
+        conn.execute(text("DELETE FROM passage_chunks"))
+        conn.commit()
+    elapsed = time.time() - t0
+    engine.dispose()
+    logger.info("Bulk delete: all records in %.2fs", elapsed)
+    return elapsed
+
+
 def _insert_qa_group(engine, qa: Dict) -> None:
     """Insert passages + chunks for one QA item."""
     qa_id = qa["qa_id"]
@@ -191,7 +204,9 @@ def _insert_qa_group(engine, qa: Dict) -> None:
             title = pg.get("title", "")
             content = pg.get("text", "")
             conn.execute(
-                text("INSERT INTO passages (qa_id, title, content) VALUES (:a, :b, :c)"),
+                text(
+                    "INSERT INTO passages (qa_id, title, content) VALUES (:a, :b, :c)"
+                ),
                 {"a": qa_id, "b": title, "c": content},
             )
             for ci, chunk in enumerate(_chunk_text(content)):
@@ -264,7 +279,7 @@ async def run_experiment(
         for qa in retrieve_qa:
             groups[qa["qa_id"]].append(qa)
 
-        answers: List[str] = []
+        answers: List[tuple] = []
         qa_order: List[Dict] = []
 
         async def _do_retrieve(qa: Dict):
@@ -286,17 +301,22 @@ async def run_experiment(
         for qa_id, qa_list in groups.items():
             for qa in qa_list:
                 _insert_qa_group(engine, qa)
-            group_answers = await asyncio.gather(
-                *[_do_retrieve(qa) for qa in qa_list]
-            )
+            group_answers = await asyncio.gather(*[_do_retrieve(qa) for qa in qa_list])
             _delete_qa_group(engine, qa_id)
             for qa, ans in zip(qa_list, group_answers):
+                answer, retrieved = (
+                    (ans[0] or "", ans[1] or [])
+                    if isinstance(ans, tuple) and len(ans) >= 2
+                    else (ans or "", [])
+                )
                 qa_order.append(qa)
-                answers.append(ans or "")
+                answers.append((answer, retrieved))
 
         per_item: list = []
-        for qa, answer in zip(qa_order, answers):
+        all_retrieved: list[list[str]] = []
+        for qa, (answer, retrieved) in zip(qa_order, answers):
             golds = qa["gold_answers"]
+            all_retrieved.append(retrieved)
             per_item.append(
                 {
                     "qa_id": qa["qa_id"],
@@ -304,8 +324,9 @@ async def run_experiment(
                     "answerable": qa["answerable"],
                     "ground_truth": golds,
                     "prediction": answer,
+                    "retrieved_texts": retrieved,
                     "f1": token_f1(answer, golds),
-                    "recall": token_recall(answer, golds),
+                    "recall": token_recall(answer, golds, retrieved_texts=retrieved),
                     "accuracy": accuracy(
                         accuracy_llm, qa["question"], answer, golds, "clapnq"
                     ),
@@ -316,20 +337,32 @@ async def run_experiment(
         predictions = [item["prediction"] for item in per_item]
         ground_truths = [item["ground_truth"] for item in per_item]
         qa_metrics = compute_metrics(
-            accuracy_llm, questions, predictions, ground_truths, "clapnq"
+            accuracy_llm,
+            questions,
+            predictions,
+            ground_truths,
+            "clapnq",
+            retrieved_texts_list=all_retrieved,
         )
 
         ans_ques: dict = defaultdict(list)
         ans_preds: dict = defaultdict(list)
         ans_gts: dict = defaultdict(list)
+        ans_retrieved: dict = defaultdict(list)
         for item in per_item:
             label = "answerable" if item["answerable"] else "unanswerable"
             ans_ques[label].append(item["question"])
             ans_preds[label].append(item["prediction"])
             ans_gts[label].append(item["ground_truth"])
+            ans_retrieved[label].append(item.get("retrieved_texts", []))
         split_metrics = {
             k: compute_metrics(
-                accuracy_llm, ans_ques[k], ans_preds[k], ans_gts[k], "clapnq"
+                accuracy_llm,
+                ans_ques[k],
+                ans_preds[k],
+                ans_gts[k],
+                "clapnq",
+                retrieved_texts_list=ans_retrieved[k],
             )
             for k in sorted(ans_preds)
         }
@@ -360,28 +393,7 @@ async def run_experiment(
     rng = random.Random(42)
     retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
 
-    qa_ids = list({q["qa_id"] for q in all_qa})
-    insert_ids = rng.sample(qa_ids, min(sample_size, len(qa_ids)))
-
     sem = asyncio.Semaphore(config.CONCURRENCY)
-
-    # ── INSERT ──────────────────────────────────────────────────────────────
-    print(
-        "\n[INSERT] %d records (concurrency=%d)..."
-        % (len(insert_ids), config.CONCURRENCY)
-    )
-
-    async def _do_insert(qa_id):
-        prompt = (
-            f"Insert a new record into the passage_chunks table with: "
-            f"qa_id='{qa_id}', title='test', chunk_index=9999, "
-            f"content='[test insert placeholder for {qa_id}]'"
-        )
-        async with sem:
-            with op.track("insert"):
-                await arun_agent(agent, prompt)
-
-    await _run_concurrent([_do_insert(qid) for qid in insert_ids], "insert")
 
     # ── RETRIEVE ────────────────────────────────────────────────────────────
     print(
@@ -405,7 +417,7 @@ async def run_experiment(
             with op.track("retrieve"):
                 return await arun_agent(agent, prompt)
 
-    answers = await _run_concurrent(
+    results = await _run_concurrent(
         [_do_retrieve(qa) for qa in retrieve_qa], "retrieve"
     )
 
@@ -413,13 +425,19 @@ async def run_experiment(
     questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[Union[str, List[str]]] = []
+    all_retrieved: list[list[str]] = []
     per_item: list[dict] = []
-    for qa, answer in zip(retrieve_qa, answers):
-        answer = answer or ""
+    for qa, res in zip(retrieve_qa, results):
+        answer, retrieved = (
+            (res[0] or "", res[1] or [])
+            if isinstance(res, tuple) and len(res) >= 2
+            else (res or "", [])
+        )
         predictions.append(answer)
         questions.append(qa["question"])
         golds = qa["gold_answers"]
         ground_truths.append(golds)
+        all_retrieved.append(retrieved)
         per_item.append(
             {
                 "qa_id": qa["qa_id"],
@@ -427,8 +445,9 @@ async def run_experiment(
                 "answerable": qa["answerable"],
                 "ground_truth": golds,
                 "prediction": answer,
+                "retrieved_texts": retrieved,
                 "f1": token_f1(answer, golds),
-                "recall": token_recall(answer, golds),
+                "recall": token_recall(answer, golds, retrieved_texts=retrieved),
                 "accuracy": accuracy(
                     accuracy_llm, qa["question"], answer, golds, "clapnq"
                 ),
@@ -436,38 +455,36 @@ async def run_experiment(
         )
 
     # ── DELETE ──────────────────────────────────────────────────────────────
-    print(
-        "\n[DELETE] %d records (concurrency=%d)..."
-        % (len(insert_ids), config.CONCURRENCY)
-    )
-
-    async def _do_delete(qa_id):
-        prompt = (
-            f"Delete the record from passage_chunks where "
-            f"qa_id = '{qa_id}' AND chunk_index = 9999."
-        )
-        async with sem:
-            with op.track("delete"):
-                await arun_agent(agent, prompt)
-
-    await _run_concurrent([_do_delete(qid) for qid in insert_ids], "delete")
+    bulk_delete_time = _bulk_delete(db_path)
 
     # ── Metrics ─────────────────────────────────────────────────────────────
     qa_metrics = compute_metrics(
-        accuracy_llm, questions, predictions, ground_truths, "clapnq"
+        accuracy_llm,
+        questions,
+        predictions,
+        ground_truths,
+        "clapnq",
+        retrieved_texts_list=all_retrieved,
     )
 
     ans_ques: dict = defaultdict(list)
     ans_preds: dict = defaultdict(list)
     ans_gts: dict = defaultdict(list)
+    ans_retrieved: dict = defaultdict(list)
     for item in per_item:
         label = "answerable" if item["answerable"] else "unanswerable"
         ans_ques[label].append(item["question"])
         ans_preds[label].append(item["prediction"])
         ans_gts[label].append(item["ground_truth"])
+        ans_retrieved[label].append(item.get("retrieved_texts", []))
     split_metrics = {
         k: compute_metrics(
-            accuracy_llm, ans_ques[k], ans_preds[k], ans_gts[k], "clapnq"
+            accuracy_llm,
+            ans_ques[k],
+            ans_preds[k],
+            ans_gts[k],
+            "clapnq",
+            retrieved_texts_list=ans_retrieved[k],
         )
         for k in sorted(ans_preds)
     }
@@ -479,9 +496,8 @@ async def run_experiment(
         "concurrency": config.CONCURRENCY,
         "num_qa_total": len(all_qa),
         "num_retrieve": len(retrieve_qa),
-        "num_insert": len(insert_ids),
-        "num_delete": len(insert_ids),
         "bulk_insert_time": bulk_time,
+        "bulk_delete_time": bulk_delete_time,
         "qa_metrics": qa_metrics,
         "qa_metrics_by_answerability": split_metrics,
         "insert_metrics": op.summary("insert"),
@@ -511,6 +527,8 @@ def _print_report(r: Dict) -> None:
     print()
     if "bulk_insert_time" in r:
         print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+    if "bulk_delete_time" in r:
+        print(f"  Bulk delete time: {r['bulk_delete_time']:.2f}s")
 
     for op_name in ("insert", "retrieve", "delete"):
         m = r.get(f"{op_name}_metrics", {})

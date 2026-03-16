@@ -218,23 +218,19 @@ def _bulk_insert(db_path: str, articles: List[Dict]) -> float:
     return elapsed
 
 
-# ── Async helpers ────────────────────────────────────────────────────────────
+def _bulk_delete(db_path: str) -> float:
+    engine = create_engine(f"sqlite:///{db_path}")
+    t0 = time.time()
 
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM article_chunks"))
+        conn.execute(text("DELETE FROM articles"))
+        conn.commit()
 
-async def _run_concurrent(coros: list, desc: str) -> list:
-    pbar = tqdm(total=len(coros), desc=desc)
-    results: list = [None] * len(coros)
-
-    async def _wrap(idx: int, coro):
-        results[idx] = await coro
-        pbar.update(1)
-
-    await asyncio.gather(*[_wrap(i, c) for i, c in enumerate(coros)])
-    pbar.close()
-    return results
-
-
-# ── Experiment runner ────────────────────────────────────────────────────────
+    elapsed = time.time() - t0
+    engine.dispose()
+    logger.info("Bulk delete: all records in %.2fs", elapsed)
+    return elapsed
 
 
 def _insert_context_group(engine, qa: Dict) -> None:
@@ -264,8 +260,29 @@ def _insert_context_group(engine, qa: Dict) -> None:
 def _delete_context_group(engine, qa_id: str) -> None:
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM articles WHERE wiki_id = :q"), {"q": qa_id})
-        conn.execute(text("DELETE FROM article_chunks WHERE wiki_id = :q"), {"q": qa_id})
+        conn.execute(
+            text("DELETE FROM article_chunks WHERE wiki_id = :q"), {"q": qa_id}
+        )
         conn.commit()
+
+
+# ── Async helpers ────────────────────────────────────────────────────────────
+
+
+async def _run_concurrent(coros: list, desc: str) -> list:
+    pbar = tqdm(total=len(coros), desc=desc)
+    results: list = [None] * len(coros)
+
+    async def _wrap(idx: int, coro):
+        results[idx] = await coro
+        pbar.update(1)
+
+    await asyncio.gather(*[_wrap(i, c) for i, c in enumerate(coros)])
+    pbar.close()
+    return results
+
+
+# ── Experiment runner ────────────────────────────────────────────────────────
 
 
 async def run_experiment(
@@ -336,13 +353,19 @@ async def run_experiment(
         questions: list[str] = []
         predictions: list[str] = []
         ground_truths: list[Union[str, List[str]]] = []
+        all_retrieved: list[list[str]] = []
         per_item: list[dict] = []
-        for qa, answer in qa_answers:
-            answer = answer or ""
+        for qa, ans in qa_answers:
+            answer, retrieved = (
+                (ans[0] or "", ans[1] or [])
+                if isinstance(ans, tuple) and len(ans) >= 2
+                else (ans or "", [])
+            )
             predictions.append(answer)
             questions.append(qa["question"])
             gt = qa["answer"]
             ground_truths.append(gt)
+            all_retrieved.append(retrieved)
             per_item.append(
                 {
                     "id": qa["id"],
@@ -352,8 +375,9 @@ async def run_experiment(
                     "ground_truth": gt,
                     "evidence_sentences": qa["evidence_sentences"],
                     "prediction": answer,
+                    "retrieved_texts": retrieved,
                     "f1": token_f1(answer, gt),
-                    "recall": token_recall(answer, gt),
+                    "recall": token_recall(answer, gt, retrieved_texts=retrieved),
                     "accuracy": accuracy(
                         accuracy_llm, qa["question"], answer, gt, "hotpotqa"
                     ),
@@ -361,19 +385,31 @@ async def run_experiment(
             )
 
         qa_metrics = compute_metrics(
-            accuracy_llm, questions, predictions, ground_truths, "hotpotqa"
+            accuracy_llm,
+            questions,
+            predictions,
+            ground_truths,
+            "hotpotqa",
+            retrieved_texts_list=all_retrieved,
         )
         type_preds: dict = defaultdict(list)
         type_gts: dict = defaultdict(list)
         type_questions: dict = defaultdict(list)
+        type_retrieved: dict = defaultdict(list)
         for item in per_item:
             t = item["type"]
             type_preds[t].append(item["prediction"])
             type_gts[t].append(item["ground_truth"])
             type_questions[t].append(item["question"])
+            type_retrieved[t].append(item.get("retrieved_texts", []))
         type_metrics = {
             t: compute_metrics(
-                accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "hotpotqa"
+                accuracy_llm,
+                type_questions[t],
+                type_preds[t],
+                type_gts[t],
+                "hotpotqa",
+                retrieved_texts_list=type_retrieved[t],
             )
             for t in sorted(type_preds)
         }
@@ -406,29 +442,7 @@ async def run_experiment(
 
     rng = random.Random(42)
     retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
-
-    wiki_ids = list({a["wiki_id"] for a in articles})
-    insert_ids = rng.sample(wiki_ids, min(sample_size, len(wiki_ids)))
-
     sem = asyncio.Semaphore(config.CONCURRENCY)
-
-    # ── INSERT ──────────────────────────────────────────────────────────────
-    print(
-        "\n[INSERT] %d records (concurrency=%d)..."
-        % (len(insert_ids), config.CONCURRENCY)
-    )
-
-    async def _do_insert(wiki_id):
-        prompt = (
-            f"Insert a new record into the article_chunks table with: "
-            f"wiki_id='{wiki_id}', title='test', chunk_index=9999, "
-            f"content='[test insert placeholder for {wiki_id}]'"
-        )
-        async with sem:
-            with op.track("insert"):
-                await arun_agent(agent, prompt)
-
-    await _run_concurrent([_do_insert(wid) for wid in insert_ids], "insert")
 
     # ── RETRIEVE ────────────────────────────────────────────────────────────
     print(
@@ -451,20 +465,26 @@ async def run_experiment(
             with op.track("retrieve"):
                 return await arun_agent(agent, prompt)
 
-    answers = await _run_concurrent(
+    results = await _run_concurrent(
         [_do_retrieve(qa) for qa in retrieve_qa], "retrieve"
     )
 
     questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[Union[str, List[str]]] = []
+    all_retrieved: list[list[str]] = []
     per_item: list[dict] = []
-    for qa, answer in zip(retrieve_qa, answers):
-        answer = answer or ""
+    for qa, res in zip(retrieve_qa, results):
+        answer, retrieved = (
+            (res[0] or "", res[1] or [])
+            if isinstance(res, tuple) and len(res) >= 2
+            else (res or "", [])
+        )
         predictions.append(answer)
         questions.append(qa["question"])
         gt = qa["answer"]
         ground_truths.append(gt)
+        all_retrieved.append(retrieved)
         per_item.append(
             {
                 "id": qa["id"],
@@ -474,8 +494,9 @@ async def run_experiment(
                 "ground_truth": gt,
                 "evidence_sentences": qa["evidence_sentences"],
                 "prediction": answer,
+                "retrieved_texts": retrieved,
                 "f1": token_f1(answer, gt),
-                "recall": token_recall(answer, gt),
+                "recall": token_recall(answer, gt, retrieved_texts=retrieved),
                 "accuracy": accuracy(
                     accuracy_llm, qa["question"], answer, gt, "hotpotqa"
                 ),
@@ -483,38 +504,36 @@ async def run_experiment(
         )
 
     # ── DELETE ──────────────────────────────────────────────────────────────
-    print(
-        "\n[DELETE] %d records (concurrency=%d)..."
-        % (len(insert_ids), config.CONCURRENCY)
-    )
-
-    async def _do_delete(wiki_id):
-        prompt = (
-            f"Delete the record from article_chunks where "
-            f"wiki_id = '{wiki_id}' AND chunk_index = 9999."
-        )
-        async with sem:
-            with op.track("delete"):
-                await arun_agent(agent, prompt)
-
-    await _run_concurrent([_do_delete(wid) for wid in insert_ids], "delete")
+    bulk_delete_time = _bulk_delete(db_path)
 
     # ── Metrics ─────────────────────────────────────────────────────────────
     qa_metrics = compute_metrics(
-        accuracy_llm, questions, predictions, ground_truths, "hotpotqa"
+        accuracy_llm,
+        questions,
+        predictions,
+        ground_truths,
+        "hotpotqa",
+        retrieved_texts_list=all_retrieved,
     )
 
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
     type_questions: dict = defaultdict(list)
+    type_retrieved: dict = defaultdict(list)
     for item in per_item:
         t = item["type"]
         type_preds[t].append(item["prediction"])
         type_gts[t].append(item["ground_truth"])
         type_questions[t].append(item["question"])
+        type_retrieved[t].append(item.get("retrieved_texts", []))
     type_metrics = {
         t: compute_metrics(
-            accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "hotpotqa"
+            accuracy_llm,
+            type_questions[t],
+            type_preds[t],
+            type_gts[t],
+            "hotpotqa",
+            retrieved_texts_list=type_retrieved[t],
         )
         for t in sorted(type_preds)
     }
@@ -526,9 +545,8 @@ async def run_experiment(
         "num_articles": len(articles),
         "num_qa_total": len(all_qa),
         "num_retrieve": len(retrieve_qa),
-        "num_insert": len(insert_ids),
-        "num_delete": len(insert_ids),
         "bulk_insert_time": bulk_time,
+        "bulk_delete_time": bulk_delete_time,
         "qa_metrics": qa_metrics,
         "qa_metrics_by_type": type_metrics,
         "insert_metrics": op.summary("insert"),
@@ -558,6 +576,8 @@ def _print_report(r: Dict) -> None:
     print()
     if "bulk_insert_time" in r:
         print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+    if "bulk_delete_time" in r:
+        print(f"  Bulk delete time: {r['bulk_delete_time']:.2f}s")
     if "setup_time" in r:
         print(
             f"  Doc groups: {r['num_doc_groups']}  "

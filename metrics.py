@@ -127,13 +127,16 @@ def token_recall(
     ground_truth: Union[str, List[str]],
     soft_threshold: float = 0.8,
     min_soft_match_tokens: int = 4,
+    retrieved_texts: List[str] | None = None,
 ) -> float:
     """Public recall entry-point.
 
-    *prediction* is treated as a single retrieved text block.
+    If *retrieved_texts* is provided (the raw SQL query results from the
+    agent's intermediate steps), recall is computed against those.
+    Otherwise falls back to using *prediction* (the agent's final answer).
     *ground_truth* (str or list of str) is the evidence list.
     """
-    retrieved = [prediction]
+    retrieved = retrieved_texts if retrieved_texts else [prediction]
     evidence = ground_truth if isinstance(ground_truth, list) else [ground_truth]
     return _token_recall_single(
         retrieved, evidence, soft_threshold, min_soft_match_tokens
@@ -292,12 +295,14 @@ def compute_metrics(
     ground_truths: List[Union[str, List[str]]],
     dataset_name: str = "Locomo",
     evidences: List[Union[str, List[str]]] | None = None,
+    retrieved_texts_list: List[List[str]] | None = None,
 ) -> Dict[str, Any]:
     """Return averaged F1, recall, and accuracy over (pred, gt) pairs.
 
-    If *evidences* is provided, recall is computed against evidence texts
-    instead of ground_truths.  ``accuracy`` is normalised to 0.0-1.0
-    (raw score / 4).  ``accuracy_raw`` is the mean raw score (0-4 scale).
+    *evidences* overrides ground_truths as the recall target (what to match).
+    *retrieved_texts_list* overrides predictions as the recall source
+    (the actual DB query results from agent intermediate steps).
+    ``accuracy`` is normalised to 0.0-1.0 (raw score / 4).
     """
     assert len(predictions) == len(ground_truths)
     n = len(predictions)
@@ -305,7 +310,13 @@ def compute_metrics(
         return {"f1": 0.0, "recall": 0.0, "accuracy": 0.0, "accuracy_raw": 0.0}
     recall_targets = evidences if evidences is not None else ground_truths
     f1s = [token_f1(p, g) for p, g in zip(predictions, ground_truths)]
-    recalls = [token_recall(p, e) for p, e in zip(predictions, recall_targets)]
+    if retrieved_texts_list is not None:
+        recalls = [
+            token_recall(p, e, retrieved_texts=rt)
+            for p, e, rt in zip(predictions, recall_targets, retrieved_texts_list)
+        ]
+    else:
+        recalls = [token_recall(p, e) for p, e in zip(predictions, recall_targets)]
     acc_results = [
         accuracy(llm, q, p, g, dataset_name)
         for q, p, g in zip(questions, predictions, ground_truths)

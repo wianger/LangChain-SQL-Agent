@@ -121,25 +121,39 @@ def build_agent(
         verbose=verbose,
         max_iterations=max_iterations,
         handle_parsing_errors=True,
-        return_intermediate_steps=False,
+        return_intermediate_steps=True,
     )
 
 
-def run_agent(executor: AgentExecutor, question: str) -> str:
-    """Invoke the agent synchronously and return the final answer string."""
+def _extract_retrieved_texts(result: Dict[str, Any]) -> List[str]:
+    """Extract SQL query results from agent intermediate steps."""
+    texts: List[str] = []
+    for action, observation in result.get("intermediate_steps", []):
+        if getattr(action, "tool", None) != "sql_db_query":
+            continue
+        if not isinstance(observation, str):
+            observation = str(observation)
+        obs_stripped = observation.strip()
+        if obs_stripped and not obs_stripped.startswith(("OK", "Error")):
+            texts.append(obs_stripped)
+    return texts
+
+
+def run_agent(executor: AgentExecutor, question: str) -> tuple[str, List[str]]:
+    """Invoke the agent and return (answer, retrieved_texts)."""
     try:
         result = executor.invoke({"input": question})
-        return result.get("output", "")
+        return result.get("output", ""), _extract_retrieved_texts(result)
     except Exception as exc:
         logger.warning("Agent error: %s", exc)
-        return f"[ERROR] {exc}"
+        return f"[ERROR] {exc}", []
 
 
-async def arun_agent(executor: AgentExecutor, question: str) -> str:
-    """Invoke the agent in a thread (async-friendly) and return the answer."""
+async def arun_agent(executor: AgentExecutor, question: str) -> tuple[str, List[str]]:
+    """Invoke the agent in a thread (async-friendly) and return (answer, retrieved_texts)."""
     try:
         result = await asyncio.to_thread(executor.invoke, {"input": question})
-        return result.get("output", "")
+        return result.get("output", ""), _extract_retrieved_texts(result)
     except Exception as exc:
         logger.warning("Agent error: %s", exc)
-        return f"[ERROR] {exc}"
+        return f"[ERROR] {exc}", []
