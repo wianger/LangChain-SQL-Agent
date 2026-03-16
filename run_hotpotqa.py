@@ -90,6 +90,13 @@ def _load_qa() -> List[Dict]:
             if 0 <= sid < len(sents):
                 evidence_sentences.append(sents[sid].strip())
 
+        context_articles: List[Dict[str, str]] = []
+        for t, sents in zip(ctx_titles, ctx_sentences):
+            full = " ".join(s.strip() for s in sents if s.strip())
+            full = re.sub(r"<[^>]+>", "", full)
+            if full:
+                context_articles.append({"title": t, "content": full})
+
         qa_list.append(
             {
                 "id": item["id"],
@@ -99,6 +106,7 @@ def _load_qa() -> List[Dict]:
                 "level": item.get("level", ""),
                 "supporting_titles": list(set(sf_titles)),
                 "evidence_sentences": evidence_sentences,
+                "context_articles": context_articles,
             }
         )
     return qa_list
@@ -229,15 +237,47 @@ async def _run_concurrent(coros: list, desc: str) -> list:
 # ── Experiment runner ────────────────────────────────────────────────────────
 
 
+def _insert_context_group(engine, qa: Dict) -> None:
+    """Insert the context articles embedded in a QA item."""
+    qa_id = qa["id"]
+    with engine.connect() as conn:
+        for art in qa.get("context_articles", []):
+            conn.execute(
+                text(
+                    "INSERT INTO articles (wiki_id, title, url, content) "
+                    "VALUES (:a, :b, :c, :d)"
+                ),
+                {"a": qa_id, "b": art["title"], "c": "", "d": art["content"]},
+            )
+            for ci, chunk in enumerate(_chunk_text(art["content"])):
+                conn.execute(
+                    text(
+                        "INSERT INTO article_chunks "
+                        "(wiki_id, title, chunk_index, content) "
+                        "VALUES (:a, :b, :c, :d)"
+                    ),
+                    {"a": qa_id, "b": art["title"], "c": ci, "d": chunk},
+                )
+        conn.commit()
+
+
+def _delete_context_group(engine, qa_id: str) -> None:
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM articles WHERE wiki_id = :q"), {"q": qa_id})
+        conn.execute(text("DELETE FROM article_chunks WHERE wiki_id = :q"), {"q": qa_id})
+        conn.commit()
+
+
 async def run_experiment(
     sample_size: int = config.SMALL_SAMPLE_SIZE,
     verbose: bool = False,
+    mode: str = "bulk",
 ) -> Dict[str, Any]:
 
     print("\n" + "=" * 60)
     print(
-        "  HotpotQA Evaluation  (sample_size=%d, concurrency=%d)"
-        % (sample_size, config.CONCURRENCY)
+        "  HotpotQA Evaluation  (sample_size=%d, concurrency=%d, mode=%s)"
+        % (sample_size, config.CONCURRENCY, mode)
     )
     print("=" * 60)
 
@@ -246,6 +286,117 @@ async def run_experiment(
 
     db_path = config.HOTPOTQA_DB
     _init_db(db_path)
+
+    if mode == "per-question":
+        tracker = TokenTracker(config.TIKTOKEN_ENCODING)
+        op = OperationTracker(tracker)
+        agent = build_agent(db_path, tracker, verbose=verbose)
+        accuracy_llm = get_llm()
+        sem = asyncio.Semaphore(config.CONCURRENCY)
+
+        rng = random.Random(42)
+        retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
+
+        async def _pq_retrieve(qa):
+            title_hints = ", ".join(f"'{t}'" for t in qa["supporting_titles"][:3])
+            prompt = (
+                f"Using the Wikipedia articles stored in the database, "
+                f"answer the following multi-hop question. "
+                f"Hint: relevant articles may include {title_hints}. "
+                f"Search in both 'articles' and 'article_chunks' tables. "
+                f"Give a concise answer. "
+                f"If the answer cannot be found, reply 'unanswerable'.\n\n"
+                f"Question: {qa['question']}"
+            )
+            async with sem:
+                with op.track("retrieve"):
+                    return await arun_agent(agent, prompt)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        setup_time = 0.0
+        teardown_time = 0.0
+        qa_answers: list[tuple] = []
+
+        pbar = tqdm(total=len(retrieve_qa), desc="per-question retrieve")
+        for qa in retrieve_qa:
+            t0 = time.time()
+            _insert_context_group(engine, qa)
+            setup_time += time.time() - t0
+
+            ans = await _pq_retrieve(qa)
+            qa_answers.append((qa, ans))
+            pbar.update(1)
+
+            t0 = time.time()
+            _delete_context_group(engine, qa["id"])
+            teardown_time += time.time() - t0
+        pbar.close()
+        engine.dispose()
+
+        questions: list[str] = []
+        predictions: list[str] = []
+        ground_truths: list[Union[str, List[str]]] = []
+        per_item: list[dict] = []
+        for qa, answer in qa_answers:
+            answer = answer or ""
+            predictions.append(answer)
+            questions.append(qa["question"])
+            gt = qa["answer"]
+            ground_truths.append(gt)
+            per_item.append(
+                {
+                    "id": qa["id"],
+                    "question": qa["question"],
+                    "type": qa["type"],
+                    "level": qa["level"],
+                    "ground_truth": gt,
+                    "evidence_sentences": qa["evidence_sentences"],
+                    "prediction": answer,
+                    "f1": token_f1(answer, gt),
+                    "recall": token_recall(answer, gt),
+                    "accuracy": accuracy(
+                        accuracy_llm, qa["question"], answer, gt, "hotpotqa"
+                    ),
+                }
+            )
+
+        qa_metrics = compute_metrics(
+            accuracy_llm, questions, predictions, ground_truths, "hotpotqa"
+        )
+        type_preds: dict = defaultdict(list)
+        type_gts: dict = defaultdict(list)
+        type_questions: dict = defaultdict(list)
+        for item in per_item:
+            t = item["type"]
+            type_preds[t].append(item["prediction"])
+            type_gts[t].append(item["ground_truth"])
+            type_questions[t].append(item["question"])
+        type_metrics = {
+            t: compute_metrics(
+                accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "hotpotqa"
+            )
+            for t in sorted(type_preds)
+        }
+
+        report = {
+            "dataset": "HotpotQA",
+            "mode": "per-question",
+            "sample_size": sample_size,
+            "concurrency": config.CONCURRENCY,
+            "num_articles": len(articles),
+            "num_qa_total": len(all_qa),
+            "num_doc_groups": len(retrieve_qa),
+            "num_retrieve": len(retrieve_qa),
+            "setup_time": setup_time,
+            "teardown_time": teardown_time,
+            "qa_metrics": qa_metrics,
+            "qa_metrics_by_type": type_metrics,
+            "retrieve_metrics": op.summary("retrieve"),
+            "per_item": per_item,
+        }
+        _print_report(report)
+        return report
+
     bulk_time = _bulk_insert(db_path, articles)
 
     tracker = TokenTracker(config.TIKTOKEN_ENCODING)
@@ -392,7 +543,7 @@ async def run_experiment(
 
 def _print_report(r: Dict) -> None:
     print("\n" + "-" * 60)
-    print("  HotpotQA Results")
+    print(f"  HotpotQA Results  (mode={r.get('mode', 'bulk')})")
     print("-" * 60)
     qm = r["qa_metrics"]
     print(f"  F1:       {qm['f1']:.4f}")
@@ -405,7 +556,13 @@ def _print_report(r: Dict) -> None:
             f"  [{t}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}"
         )
     print()
-    print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+    if "bulk_insert_time" in r:
+        print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+    if "setup_time" in r:
+        print(
+            f"  Doc groups: {r['num_doc_groups']}  "
+            f"Setup: {r['setup_time']:.2f}s  Teardown: {r['teardown_time']:.2f}s"
+        )
 
     for op_name in ("insert", "retrieve", "delete"):
         m = r.get(f"{op_name}_metrics", {})

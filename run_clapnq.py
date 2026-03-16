@@ -76,17 +76,13 @@ def _load_jsonl(path: str) -> List[Dict]:
 
 
 def _load_all_data() -> List[Dict]:
-    """Load train + dev (answerable + unanswerable) as a unified QA list."""
+    """Load train + dev answerable QA items (unanswerable items are excluded)."""
     base = config.CLAPNQ_DATA_DIR
 
     raw_answerable: List[Dict] = []
-    raw_unanswerable: List[Dict] = []
     for split in ("train", "dev"):
         raw_answerable.extend(
             _load_jsonl(os.path.join(base, split, f"clapnq_{split}_answerable.jsonl"))
-        )
-        raw_unanswerable.extend(
-            _load_jsonl(os.path.join(base, split, f"clapnq_{split}_unanswerable.jsonl"))
         )
 
     qa_list: List[Dict] = []
@@ -98,7 +94,7 @@ def _load_all_data() -> List[Dict]:
             if ans:
                 gold_answers.append(ans)
         if not gold_answers:
-            gold_answers = ["unanswerable"]
+            continue
 
         qa_list.append(
             {
@@ -107,17 +103,6 @@ def _load_all_data() -> List[Dict]:
                 "passages": item.get("passages", []),
                 "gold_answers": gold_answers,
                 "answerable": True,
-            }
-        )
-
-    for item in raw_unanswerable:
-        qa_list.append(
-            {
-                "qa_id": str(item["id"]),
-                "question": item["input"],
-                "passages": item.get("passages", []),
-                "gold_answers": ["unanswerable"],
-                "answerable": False,
             }
         )
 
@@ -198,6 +183,35 @@ def _bulk_insert(db_path: str, qa_data: List[Dict]) -> float:
     return elapsed
 
 
+def _insert_qa_group(engine, qa: Dict) -> None:
+    """Insert passages + chunks for one QA item."""
+    qa_id = qa["qa_id"]
+    with engine.connect() as conn:
+        for pg in qa.get("passages", []):
+            title = pg.get("title", "")
+            content = pg.get("text", "")
+            conn.execute(
+                text("INSERT INTO passages (qa_id, title, content) VALUES (:a, :b, :c)"),
+                {"a": qa_id, "b": title, "c": content},
+            )
+            for ci, chunk in enumerate(_chunk_text(content)):
+                conn.execute(
+                    text(
+                        "INSERT INTO passage_chunks "
+                        "(qa_id, title, chunk_index, content) VALUES (:a, :b, :c, :d)"
+                    ),
+                    {"a": qa_id, "b": title, "c": ci, "d": chunk},
+                )
+        conn.commit()
+
+
+def _delete_qa_group(engine, qa_id: str) -> None:
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM passages WHERE qa_id = :q"), {"q": qa_id})
+        conn.execute(text("DELETE FROM passage_chunks WHERE qa_id = :q"), {"q": qa_id})
+        conn.commit()
+
+
 # ── Async helpers ────────────────────────────────────────────────────────────
 
 
@@ -220,12 +234,13 @@ async def _run_concurrent(coros: list, desc: str) -> list:
 async def run_experiment(
     sample_size: int = config.SMALL_SAMPLE_SIZE,
     verbose: bool = False,
+    mode: str = "bulk",
 ) -> Dict[str, Any]:
 
     print("\n" + "=" * 60)
     print(
-        "  CLAPNQ Evaluation  (sample_size=%d, concurrency=%d)"
-        % (sample_size, config.CONCURRENCY)
+        "  CLAPNQ Evaluation  (sample_size=%d, concurrency=%d, mode=%s)"
+        % (sample_size, config.CONCURRENCY, mode)
     )
     print("=" * 60)
 
@@ -233,6 +248,109 @@ async def run_experiment(
 
     db_path = config.CLAPNQ_DB
     _init_db(db_path)
+
+    if mode == "per-question":
+        engine = create_engine(f"sqlite:///{db_path}")
+        tracker = TokenTracker(config.TIKTOKEN_ENCODING)
+        op = OperationTracker(tracker)
+        agent = build_agent(db_path, tracker, verbose=verbose)
+        accuracy_llm = get_llm()
+        sem = asyncio.Semaphore(config.CONCURRENCY)
+
+        rng = random.Random(42)
+        retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
+
+        groups: Dict[str, List[Dict]] = defaultdict(list)
+        for qa in retrieve_qa:
+            groups[qa["qa_id"]].append(qa)
+
+        answers: List[str] = []
+        qa_order: List[Dict] = []
+
+        async def _do_retrieve(qa: Dict):
+            title_hint = ""
+            if qa["passages"]:
+                title_hint = f" The relevant passage is titled '{qa['passages'][0].get('title', '')}'."
+            prompt = (
+                f"Using the passage data stored in the database for "
+                f"qa_id '{qa['qa_id']}',{title_hint} "
+                f"answer the following question with a concise, cohesive answer. "
+                f"Search in both 'passages' and 'passage_chunks' tables. "
+                f"If the answer cannot be found, reply 'unanswerable'.\n\n"
+                f"Question: {qa['question']}"
+            )
+            async with sem:
+                with op.track("retrieve"):
+                    return await arun_agent(agent, prompt)
+
+        for qa_id, qa_list in groups.items():
+            for qa in qa_list:
+                _insert_qa_group(engine, qa)
+            group_answers = await asyncio.gather(
+                *[_do_retrieve(qa) for qa in qa_list]
+            )
+            _delete_qa_group(engine, qa_id)
+            for qa, ans in zip(qa_list, group_answers):
+                qa_order.append(qa)
+                answers.append(ans or "")
+
+        per_item: list = []
+        for qa, answer in zip(qa_order, answers):
+            golds = qa["gold_answers"]
+            per_item.append(
+                {
+                    "qa_id": qa["qa_id"],
+                    "question": qa["question"],
+                    "answerable": qa["answerable"],
+                    "ground_truth": golds,
+                    "prediction": answer,
+                    "f1": token_f1(answer, golds),
+                    "recall": token_recall(answer, golds),
+                    "accuracy": accuracy(
+                        accuracy_llm, qa["question"], answer, golds, "clapnq"
+                    ),
+                }
+            )
+
+        questions = [item["question"] for item in per_item]
+        predictions = [item["prediction"] for item in per_item]
+        ground_truths = [item["ground_truth"] for item in per_item]
+        qa_metrics = compute_metrics(
+            accuracy_llm, questions, predictions, ground_truths, "clapnq"
+        )
+
+        ans_ques: dict = defaultdict(list)
+        ans_preds: dict = defaultdict(list)
+        ans_gts: dict = defaultdict(list)
+        for item in per_item:
+            label = "answerable" if item["answerable"] else "unanswerable"
+            ans_ques[label].append(item["question"])
+            ans_preds[label].append(item["prediction"])
+            ans_gts[label].append(item["ground_truth"])
+        split_metrics = {
+            k: compute_metrics(
+                accuracy_llm, ans_ques[k], ans_preds[k], ans_gts[k], "clapnq"
+            )
+            for k in sorted(ans_preds)
+        }
+
+        report = {
+            "dataset": "CLAPNQ",
+            "sample_size": sample_size,
+            "mode": mode,
+            "concurrency": config.CONCURRENCY,
+            "num_qa_total": len(all_qa),
+            "num_retrieve": len(retrieve_qa),
+            "qa_metrics": qa_metrics,
+            "qa_metrics_by_answerability": split_metrics,
+            "retrieve_metrics": op.summary("retrieve"),
+            "per_item": per_item,
+        }
+
+        engine.dispose()
+        _print_report(report)
+        return report
+
     bulk_time = _bulk_insert(db_path, all_qa)
 
     tracker = TokenTracker(config.TIKTOKEN_ENCODING)
@@ -357,6 +475,7 @@ async def run_experiment(
     report = {
         "dataset": "CLAPNQ",
         "sample_size": sample_size,
+        "mode": mode,
         "concurrency": config.CONCURRENCY,
         "num_qa_total": len(all_qa),
         "num_retrieve": len(retrieve_qa),
@@ -377,7 +496,7 @@ async def run_experiment(
 
 def _print_report(r: Dict) -> None:
     print("\n" + "-" * 60)
-    print("  CLAPNQ Results")
+    print(f"  CLAPNQ Results  (mode={r.get('mode', 'bulk')})")
     print("-" * 60)
     qm = r["qa_metrics"]
     print(f"  F1:       {qm['f1']:.4f}")
@@ -390,7 +509,8 @@ def _print_report(r: Dict) -> None:
             f"  [{k}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}"
         )
     print()
-    print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+    if "bulk_insert_time" in r:
+        print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
 
     for op_name in ("insert", "retrieve", "delete"):
         m = r.get(f"{op_name}_metrics", {})

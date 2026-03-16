@@ -117,6 +117,32 @@ def _extract_rows(data: List[Dict]) -> Tuple[list, list, list]:
     return conv_rows, summary_rows, obs_rows
 
 
+def _build_dia_id_map(entry: Dict) -> Dict[str, str]:
+    """Build a mapping from dia_id (e.g. 'D1:3') to the dialogue text."""
+    conv = entry["conversation"]
+    mapping: Dict[str, str] = {}
+    for i in range(1, 100):
+        sess_key = f"session_{i}"
+        if sess_key not in conv or not isinstance(conv[sess_key], list):
+            continue
+        for turn in conv[sess_key]:
+            did = turn.get("dia_id", "")
+            if did:
+                mapping[did] = turn.get("text", "")
+    return mapping
+
+
+NO_ANSWER_PATTERNS = [
+    "no answer", "unanswerable", "no/insufficient information",
+    "not mentioned", "none", "n/a",
+]
+
+
+def _is_no_answer(answer: str) -> bool:
+    lowered = answer.strip().lower()
+    return any(p == lowered for p in NO_ANSWER_PATTERNS)
+
+
 def _extract_qa(data: List[Dict]) -> List[Dict]:
     qa_list: list = []
     for entry in data:
@@ -125,19 +151,29 @@ def _extract_qa(data: List[Dict]) -> List[Dict]:
             entry["conversation"].get("speaker_a", ""),
             entry["conversation"].get("speaker_b", ""),
         )
+        dia_map = _build_dia_id_map(entry)
+
         for qa in entry["qa"]:
             cat = qa["category"]
             if cat == 5:
                 continue
-            question = qa["question"]
             answer = str(qa.get("answer", ""))
+            if _is_no_answer(answer):
+                continue
+
+            evidence_refs = qa.get("evidence", [])
+            evidence_texts = [
+                dia_map[ref] for ref in evidence_refs if ref in dia_map
+            ]
+
             qa_list.append(
                 {
                     "sample_id": sid,
-                    "question": question,
+                    "question": qa["question"],
                     "answer": answer,
                     "category": cat,
                     "speakers": speakers,
+                    "evidence_texts": evidence_texts,
                 }
             )
     return qa_list
@@ -233,15 +269,57 @@ async def _run_concurrent(coros: list, desc: str) -> list:
 # ── Experiment runner ────────────────────────────────────────────────────────
 
 
+def _insert_sample(engine, entry: Dict) -> None:
+    """Direct SQL insert of one sample's conversations/summaries/observations."""
+    conv_rows, summary_rows, obs_rows = _extract_rows([entry])
+    with engine.connect() as conn:
+        for r in conv_rows:
+            conn.execute(
+                text(
+                    "INSERT INTO conversations "
+                    "(sample_id, session_id, session_date, turn_number, dia_id, speaker, text) "
+                    "VALUES (:a,:b,:c,:d,:e,:f,:g)"
+                ),
+                {"a": r[0], "b": r[1], "c": r[2], "d": r[3], "e": r[4], "f": r[5], "g": r[6]},
+            )
+        for r in summary_rows:
+            conn.execute(
+                text(
+                    "INSERT INTO session_summaries (sample_id, session_id, summary) "
+                    "VALUES (:a,:b,:c)"
+                ),
+                {"a": r[0], "b": r[1], "c": r[2]},
+            )
+        for r in obs_rows:
+            conn.execute(
+                text(
+                    "INSERT INTO observations "
+                    "(sample_id, session_id, speaker, observation, dia_id) "
+                    "VALUES (:a,:b,:c,:d,:e)"
+                ),
+                {"a": r[0], "b": r[1], "c": r[2], "d": r[3], "e": r[4]},
+            )
+        conn.commit()
+
+
+def _delete_sample(engine, sample_id: str) -> None:
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM conversations WHERE sample_id = :s"), {"s": sample_id})
+        conn.execute(text("DELETE FROM session_summaries WHERE sample_id = :s"), {"s": sample_id})
+        conn.execute(text("DELETE FROM observations WHERE sample_id = :s"), {"s": sample_id})
+        conn.commit()
+
+
 async def run_experiment(
     sample_size: int = config.SMALL_SAMPLE_SIZE,
     verbose: bool = False,
+    mode: str = "bulk",
 ) -> Dict[str, Any]:
 
     print("\n" + "=" * 60)
     print(
-        "  LoCoMo Evaluation  (sample_size=%d, concurrency=%d)"
-        % (sample_size, config.CONCURRENCY)
+        "  LoCoMo Evaluation  (sample_size=%d, concurrency=%d, mode=%s)"
+        % (sample_size, config.CONCURRENCY, mode)
     )
     print("=" * 60)
 
@@ -250,6 +328,124 @@ async def run_experiment(
 
     db_path = config.LOCOMO_DB
     _init_db(db_path)
+
+    if mode == "per-question":
+        tracker = TokenTracker(config.TIKTOKEN_ENCODING)
+        op = OperationTracker(tracker)
+        agent = build_agent(db_path, tracker, verbose=verbose)
+        accuracy_llm = get_llm()
+        sem = asyncio.Semaphore(config.CONCURRENCY)
+
+        rng = random.Random(42)
+        retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
+
+        entry_by_sid = {e["sample_id"]: e for e in data}
+        groups: dict[str, list] = defaultdict(list)
+        for qa in retrieve_qa:
+            groups[qa["sample_id"]].append(qa)
+
+        async def _pq_retrieve(qa):
+            prompt = (
+                f"Based on conversations with sample_id '{qa['sample_id']}' "
+                f"between {qa['speakers'][0]} and {qa['speakers'][1]}, "
+                f"answer the following question. If the answer cannot be found, "
+                f"reply 'unanswerable'.\n\nQuestion: {qa['question']}"
+            )
+            async with sem:
+                with op.track("retrieve"):
+                    return await arun_agent(agent, prompt)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        setup_time = 0.0
+        teardown_time = 0.0
+        qa_answers: list[tuple] = []
+
+        pbar = tqdm(total=len(retrieve_qa), desc="per-question retrieve")
+        for sid, gqas in groups.items():
+            entry = entry_by_sid.get(sid)
+            if not entry:
+                continue
+            t0 = time.time()
+            _insert_sample(engine, entry)
+            setup_time += time.time() - t0
+
+            answers = await asyncio.gather(*[_pq_retrieve(qa) for qa in gqas])
+            for qa, ans in zip(gqas, answers):
+                qa_answers.append((qa, ans))
+                pbar.update(1)
+
+            t0 = time.time()
+            _delete_sample(engine, sid)
+            teardown_time += time.time() - t0
+        pbar.close()
+        engine.dispose()
+
+        predictions: list[str] = []
+        questions: list[str] = []
+        ground_truths: list[str] = []
+        evidences: list[list[str]] = []
+        per_item: list[dict] = []
+        for qa, answer in qa_answers:
+            answer = answer or ""
+            predictions.append(answer)
+            questions.append(qa["question"])
+            ground_truths.append(qa["answer"])
+            ev = qa.get("evidence_texts", [])
+            evidences.append(ev if ev else [qa["answer"]])
+            per_item.append(
+                {
+                    "question": qa["question"],
+                    "ground_truth": qa["answer"],
+                    "evidence_texts": ev,
+                    "prediction": answer,
+                    "category": qa["category"],
+                    "f1": token_f1(answer, qa["answer"]),
+                    "recall": token_recall(answer, ev if ev else [qa["answer"]]),
+                    "accuracy": accuracy(
+                        accuracy_llm, qa["question"], answer, qa["answer"], "Locomo"
+                    ),
+                }
+            )
+
+        qa_metrics = compute_metrics(
+            accuracy_llm, questions, predictions, ground_truths, "Locomo",
+            evidences=evidences,
+        )
+        cat_preds: dict = defaultdict(list)
+        cat_gts: dict = defaultdict(list)
+        cat_questions: dict = defaultdict(list)
+        cat_evidences: dict = defaultdict(list)
+        for item in per_item:
+            c = item["category"]
+            cat_preds[c].append(item["prediction"])
+            cat_gts[c].append(item["ground_truth"])
+            cat_questions[c].append(item["question"])
+            ev = item.get("evidence_texts", [])
+            cat_evidences[c].append(ev if ev else [item["ground_truth"]])
+        cat_metrics = {
+            config.LOCOMO_CATEGORIES.get(c, str(c)): compute_metrics(
+                accuracy_llm, cat_questions[c], cat_preds[c], cat_gts[c],
+                "Locomo", evidences=cat_evidences[c],
+            )
+            for c in sorted(cat_preds)
+        }
+
+        report = {
+            "dataset": "LoCoMo",
+            "mode": "per-question",
+            "sample_size": sample_size,
+            "concurrency": config.CONCURRENCY,
+            "num_doc_groups": len(groups),
+            "num_retrieve": len(retrieve_qa),
+            "setup_time": setup_time,
+            "teardown_time": teardown_time,
+            "qa_metrics": qa_metrics,
+            "qa_metrics_by_category": cat_metrics,
+            "retrieve_metrics": op.summary("retrieve"),
+            "per_item": per_item,
+        }
+        _print_report(report)
+        return report
     bulk_time = _bulk_insert(db_path, data)
 
     tracker = TokenTracker(config.TIKTOKEN_ENCODING)
@@ -310,20 +506,24 @@ async def run_experiment(
     predictions: list[str] = []
     questions: list[str] = []
     ground_truths: list[str] = []
+    evidences: list[list[str]] = []
     per_item: list[dict] = []
     for qa, answer in zip(retrieve_qa, answers):
         answer = answer or ""
         predictions.append(answer)
         questions.append(qa["question"])
         ground_truths.append(qa["answer"])
+        ev = qa.get("evidence_texts", [])
+        evidences.append(ev if ev else [qa["answer"]])
         per_item.append(
             {
                 "question": qa["question"],
                 "ground_truth": qa["answer"],
+                "evidence_texts": ev,
                 "prediction": answer,
                 "category": qa["category"],
                 "f1": token_f1(answer, qa["answer"]),
-                "recall": token_recall(answer, qa["answer"]),
+                "recall": token_recall(answer, ev if ev else [qa["answer"]]),
                 "accuracy": accuracy(
                     accuracy_llm, qa["question"], answer, qa["answer"], "Locomo"
                 ),
@@ -346,17 +546,25 @@ async def run_experiment(
 
     # ── Metrics ─────────────────────────────────────────────────────────────
     qa_metrics = compute_metrics(
-        accuracy_llm, questions, predictions, ground_truths, "Locomo"
+        accuracy_llm, questions, predictions, ground_truths, "Locomo",
+        evidences=evidences,
     )
 
     cat_preds: dict = defaultdict(list)
     cat_gts: dict = defaultdict(list)
+    cat_questions: dict = defaultdict(list)
+    cat_evidences: dict = defaultdict(list)
     for item in per_item:
-        cat_preds[item["category"]].append(item["prediction"])
-        cat_gts[item["category"]].append(item["ground_truth"])
+        cat = item["category"]
+        cat_preds[cat].append(item["prediction"])
+        cat_gts[cat].append(item["ground_truth"])
+        cat_questions[cat].append(item["question"])
+        ev = item.get("evidence_texts", [])
+        cat_evidences[cat].append(ev if ev else [item["ground_truth"]])
     cat_metrics = {
         config.LOCOMO_CATEGORIES.get(cat, str(cat)): compute_metrics(
-            accuracy_llm, questions, cat_preds[cat], cat_gts[cat], "Locomo"
+            accuracy_llm, cat_questions[cat], cat_preds[cat], cat_gts[cat],
+            "Locomo", evidences=cat_evidences[cat],
         )
         for cat in sorted(cat_preds)
     }
@@ -383,7 +591,7 @@ async def run_experiment(
 
 def _print_report(r: Dict) -> None:
     print("\n" + "-" * 60)
-    print("  LoCoMo Results")
+    print(f"  LoCoMo Results  (mode={r.get('mode', 'bulk')})")
     print("-" * 60)
     qm = r["qa_metrics"]
     print(f"  F1:       {qm['f1']:.4f}")
@@ -395,7 +603,13 @@ def _print_report(r: Dict) -> None:
             f"  [{cat}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}"
         )
     print()
-    print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+    if "bulk_insert_time" in r:
+        print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+    if "setup_time" in r:
+        print(
+            f"  Doc groups: {r['num_doc_groups']}  "
+            f"Setup: {r['setup_time']:.2f}s  Teardown: {r['teardown_time']:.2f}s"
+        )
 
     for op_name in ("insert", "retrieve", "delete"):
         m = r.get(f"{op_name}_metrics", {})

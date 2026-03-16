@@ -91,6 +91,31 @@ def _chunk_text(text_content: str) -> List[str]:
     return chunks
 
 
+NO_ANSWER_PATTERNS = [
+    "no answer", "unanswerable", "no/insufficient information",
+    "not mentioned", "none", "n/a",
+]
+
+
+def _is_no_answer(answer: str) -> bool:
+    lowered = answer.strip().lower()
+    return any(p == lowered for p in NO_ANSWER_PATTERNS)
+
+
+def _extract_evidence(item: Dict) -> List[str]:
+    """Collect non-null answer_span_* and reasoning_step_* as evidence."""
+    ev: List[str] = []
+    for i in range(1, 6):
+        val = item.get(f"answer_span_{i}")
+        if val:
+            ev.append(str(val).strip())
+    for i in range(1, 6):
+        val = item.get(f"reasoning_step_{i}")
+        if val:
+            ev.append(str(val).strip())
+    return ev
+
+
 def _load_test_qa() -> List[Dict]:
     results: List[Dict] = []
     for fname in ("test.json", "train.json", "val.json"):
@@ -99,10 +124,19 @@ def _load_test_qa() -> List[Dict]:
             continue
         with open(fpath, "r", encoding="utf-8") as f:
             data = json.load(f)
+        raw: List[Dict] = []
         if isinstance(data, list):
-            results.extend(data)
+            raw = data
         elif isinstance(data, dict):
-            results.extend(data.values())
+            raw = list(data.values())
+
+        for item in raw:
+            answer = str(item.get("answer", ""))
+            qtype = str(item.get("question_type", "")).lower()
+            if qtype == "no answer" or _is_no_answer(answer):
+                continue
+            item["evidence_texts"] = _extract_evidence(item)
+            results.append(item)
     return results
 
 
@@ -184,18 +218,53 @@ async def _run_concurrent(coros: list, desc: str) -> list:
     return results
 
 
+def _insert_syllabus_group(engine, name: str, meta: Dict) -> None:
+    content = _load_syllabus_text(name)
+    m = meta.get(name, {})
+    with engine.connect() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO syllabi "
+                "(syllabus_name, course, major, area, university, num_pages, content) "
+                "VALUES (:a,:b,:c,:d,:e,:f,:g)"
+            ),
+            {
+                "a": name, "b": m.get("course", ""), "c": m.get("major", ""),
+                "d": m.get("area", ""), "e": m.get("university", ""),
+                "f": m.get("num_pages", 0), "g": content,
+            },
+        )
+        for ci, chunk in enumerate(_chunk_text(content)):
+            conn.execute(
+                text(
+                    "INSERT INTO syllabus_chunks "
+                    "(syllabus_name, chunk_index, content) VALUES (:a,:b,:c)"
+                ),
+                {"a": name, "b": ci, "c": chunk},
+            )
+        conn.commit()
+
+
+def _delete_syllabus_group(engine, name: str) -> None:
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM syllabi WHERE syllabus_name = :n"), {"n": name})
+        conn.execute(text("DELETE FROM syllabus_chunks WHERE syllabus_name = :n"), {"n": name})
+        conn.commit()
+
+
 # ── Experiment runner ────────────────────────────────────────────────────────
 
 
 async def run_experiment(
     sample_size: int = config.SMALL_SAMPLE_SIZE,
     verbose: bool = False,
+    mode: str = "bulk",
 ) -> Dict[str, Any]:
 
     print("\n" + "=" * 60)
     print(
-        "  SyllabusQA Evaluation  (sample_size=%d, concurrency=%d)"
-        % (sample_size, config.CONCURRENCY)
+        "  SyllabusQA Evaluation  (sample_size=%d, concurrency=%d, mode=%s)"
+        % (sample_size, config.CONCURRENCY, mode)
     )
     print("=" * 60)
 
@@ -203,6 +272,123 @@ async def run_experiment(
 
     db_path = config.SYLLABUSQA_DB
     _init_db(db_path)
+
+    if mode == "per-question":
+        tracker = TokenTracker(config.TIKTOKEN_ENCODING)
+        op = OperationTracker(tracker)
+        agent = build_agent(db_path, tracker, verbose=verbose)
+        accuracy_llm = get_llm()
+        sem = asyncio.Semaphore(config.CONCURRENCY)
+
+        rng = random.Random(42)
+        retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
+        groups: Dict[str, List[Dict]] = defaultdict(list)
+        for qa in retrieve_qa:
+            groups[qa["syllabus_name"]].append(qa)
+
+        meta = _load_meta()
+        engine = create_engine(f"sqlite:///{db_path}")
+
+        total_setup_time = 0.0
+        total_teardown_time = 0.0
+        answer_map: Dict[tuple, str] = {}
+
+        for syllabus_name, group_qas in groups.items():
+            t0 = time.time()
+            _insert_syllabus_group(engine, syllabus_name, meta)
+            total_setup_time += time.time() - t0
+
+            async def _do_retrieve_pq(qa):
+                prompt = (
+                    f"Using the syllabus data for '{qa['syllabus_name']}' stored in the database, "
+                    f"answer the following question. "
+                    f"Search in both 'syllabi' and 'syllabus_chunks' tables. "
+                    f"If the answer cannot be found, reply 'No/insufficient information'.\n\n"
+                    f"Question: {qa['question']}"
+                )
+                async with sem:
+                    with op.track("retrieve"):
+                        return await arun_agent(agent, prompt)
+
+            answers = await _run_concurrent(
+                [_do_retrieve_pq(qa) for qa in group_qas], "retrieve"
+            )
+            for qa, ans in zip(group_qas, answers):
+                answer_map[(qa["syllabus_name"], qa["question"])] = ans or ""
+
+            t0 = time.time()
+            _delete_syllabus_group(engine, syllabus_name)
+            total_teardown_time += time.time() - t0
+
+        engine.dispose()
+
+        per_item: List[Dict] = []
+        for qa in retrieve_qa:
+            answer = answer_map.get((qa["syllabus_name"], qa["question"]), "")
+            ev = qa.get("evidence_texts", [])
+            ev = ev if ev else [qa["answer"]]
+            per_item.append(
+                {
+                    "question": qa["question"],
+                    "syllabus": qa["syllabus_name"],
+                    "question_type": qa.get("question_type", ""),
+                    "ground_truth": qa["answer"],
+                    "evidence_texts": ev,
+                    "prediction": answer,
+                    "f1": token_f1(answer, qa["answer"]),
+                    "recall": token_recall(answer, ev),
+                    "accuracy": accuracy(
+                        accuracy_llm, qa["question"], answer, qa["answer"], "SyllabusQA"
+                    ),
+                }
+            )
+
+        questions = [x["question"] for x in per_item]
+        predictions = [x["prediction"] for x in per_item]
+        ground_truths = [x["ground_truth"] for x in per_item]
+        evidences = [x["evidence_texts"] for x in per_item]
+
+        qa_metrics = compute_metrics(
+            accuracy_llm, questions, predictions, ground_truths, "SyllabusQA",
+            evidences=evidences,
+        )
+
+        type_questions: dict = defaultdict(list)
+        type_preds: dict = defaultdict(list)
+        type_gts: dict = defaultdict(list)
+        type_evidences: dict = defaultdict(list)
+        for item in per_item:
+            qtype = item.get("question_type", "unknown")
+            type_questions[qtype].append(item["question"])
+            type_preds[qtype].append(item["prediction"])
+            type_gts[qtype].append(item["ground_truth"])
+            ev = item.get("evidence_texts", [])
+            type_evidences[qtype].append(ev if ev else [item["ground_truth"]])
+        type_metrics = {
+            t: compute_metrics(
+                accuracy_llm, type_questions[t], type_preds[t], type_gts[t],
+                "SyllabusQA", evidences=type_evidences[t],
+            )
+            for t in sorted(type_preds)
+        }
+
+        report = {
+            "dataset": "SyllabusQA",
+            "sample_size": sample_size,
+            "concurrency": config.CONCURRENCY,
+            "mode": "per-question",
+            "num_retrieve": len(retrieve_qa),
+            "setup_time": total_setup_time,
+            "teardown_time": total_teardown_time,
+            "num_doc_groups": len(groups),
+            "qa_metrics": qa_metrics,
+            "qa_metrics_by_type": type_metrics,
+            "retrieve_metrics": op.summary("retrieve"),
+            "per_item": per_item,
+        }
+        _print_report(report)
+        return report
+
     bulk_time = _bulk_insert(db_path, all_qa)
 
     tracker = TokenTracker(config.TIKTOKEN_ENCODING)
@@ -263,6 +449,7 @@ async def run_experiment(
     questions: list[str] = []
     predictions: list[str] = []
     ground_truths: list[str] = []
+    evidences: list[list[str]] = []
     per_item: list[dict] = []
     for qa, answer in zip(retrieve_qa, answers):
         questions.append(qa["question"])
@@ -270,15 +457,18 @@ async def run_experiment(
         predictions.append(answer)
         gt = qa["answer"]
         ground_truths.append(gt)
+        ev = qa.get("evidence_texts", [])
+        evidences.append(ev if ev else [gt])
         per_item.append(
             {
                 "question": qa["question"],
                 "syllabus": qa["syllabus_name"],
                 "question_type": qa.get("question_type", ""),
                 "ground_truth": gt,
+                "evidence_texts": ev,
                 "prediction": answer,
                 "f1": token_f1(answer, gt),
-                "recall": token_recall(answer, gt),
+                "recall": token_recall(answer, ev if ev else [gt]),
                 "accuracy": accuracy(
                     accuracy_llm, qa["question"], answer, gt, "SyllabusQA"
                 ),
@@ -304,20 +494,25 @@ async def run_experiment(
 
     # ── Metrics ─────────────────────────────────────────────────────────────
     qa_metrics = compute_metrics(
-        accuracy_llm, questions, predictions, ground_truths, "SyllabusQA"
+        accuracy_llm, questions, predictions, ground_truths, "SyllabusQA",
+        evidences=evidences,
     )
 
     type_questions: dict = defaultdict(list)
     type_preds: dict = defaultdict(list)
     type_gts: dict = defaultdict(list)
+    type_evidences: dict = defaultdict(list)
     for item in per_item:
         qtype = item.get("question_type", "unknown")
         type_questions[qtype].append(item["question"])
         type_preds[qtype].append(item["prediction"])
         type_gts[qtype].append(item["ground_truth"])
+        ev = item.get("evidence_texts", [])
+        type_evidences[qtype].append(ev if ev else [item["ground_truth"]])
     type_metrics = {
         t: compute_metrics(
-            accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "SyllabusQA"
+            accuracy_llm, type_questions[t], type_preds[t], type_gts[t],
+            "SyllabusQA", evidences=type_evidences[t],
         )
         for t in sorted(type_preds)
     }
@@ -343,8 +538,9 @@ async def run_experiment(
 
 
 def _print_report(r: Dict) -> None:
+    mode = r.get("mode", "bulk")
     print("\n" + "-" * 60)
-    print("  SyllabusQA Results")
+    print(f"  SyllabusQA Results  (mode={mode})")
     print("-" * 60)
     qm = r["qa_metrics"]
     print(f"  F1:       {qm['f1']:.4f}")
@@ -356,7 +552,12 @@ def _print_report(r: Dict) -> None:
             f"  [{t}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}"
         )
     print()
-    print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+    if "bulk_insert_time" in r:
+        print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+    if "setup_time" in r:
+        print(f"  Doc groups: {r.get('num_doc_groups', 0)}")
+        print(f"  Setup time: {r['setup_time']:.2f}s")
+        print(f"  Teardown time: {r['teardown_time']:.2f}s")
 
     for op_name in ("insert", "retrieve", "delete"):
         m = r.get(f"{op_name}_metrics", {})

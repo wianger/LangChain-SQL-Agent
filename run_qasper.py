@@ -140,9 +140,13 @@ def _extract_qa(papers: List[Dict]) -> List[Dict]:
                 else "unknown"
             )
 
+            if not gold_texts or majority_type == "unanswerable":
+                continue
+
+            # Remove any "unanswerable" entries mixed in with real answers
+            gold_texts = [t for t in gold_texts if t.lower() != "unanswerable"]
             if not gold_texts:
-                gold_texts = ["unanswerable"]
-                majority_type = "unanswerable"
+                continue
 
             qa_list.append(
                 {
@@ -258,6 +262,42 @@ def _bulk_insert(db_path: str, papers: List[Dict]) -> float:
     return elapsed
 
 
+def _insert_paper_group(engine, paper: Dict) -> None:
+    """Insert one paper + sections + chunks for per-question mode."""
+    pid = paper["id"]
+    with engine.connect() as conn:
+        conn.execute(
+            text("INSERT OR IGNORE INTO papers (paper_id, title, abstract) VALUES (:a, :b, :c)"),
+            {"a": pid, "b": paper.get("title", ""), "c": paper.get("abstract", "")},
+        )
+        for sec in _build_sections(paper):
+            conn.execute(
+                text(
+                    "INSERT INTO sections (paper_id, section_index, section_name, content) "
+                    "VALUES (:a, :b, :c, :d)"
+                ),
+                {"a": pid, "b": sec["section_index"], "c": sec["section_name"], "d": sec["content"]},
+            )
+            for ci, chunk in enumerate(_chunk_text(sec["content"])):
+                conn.execute(
+                    text(
+                        "INSERT INTO section_chunks "
+                        "(paper_id, section_index, chunk_index, content) "
+                        "VALUES (:a, :b, :c, :d)"
+                    ),
+                    {"a": pid, "b": sec["section_index"], "c": ci, "d": chunk},
+                )
+        conn.commit()
+
+
+def _delete_paper_group(engine, paper_id: str) -> None:
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM papers WHERE paper_id = :p"), {"p": paper_id})
+        conn.execute(text("DELETE FROM sections WHERE paper_id = :p"), {"p": paper_id})
+        conn.execute(text("DELETE FROM section_chunks WHERE paper_id = :p"), {"p": paper_id})
+        conn.commit()
+
+
 # ── Async helpers ────────────────────────────────────────────────────────────
 
 
@@ -280,12 +320,13 @@ async def _run_concurrent(coros: list, desc: str) -> list:
 async def run_experiment(
     sample_size: int = config.SMALL_SAMPLE_SIZE,
     verbose: bool = False,
+    mode: str = "bulk",
 ) -> Dict[str, Any]:
 
     print("\n" + "=" * 60)
     print(
-        "  QASPER Evaluation  (sample_size=%d, concurrency=%d)"
-        % (sample_size, config.CONCURRENCY)
+        "  QASPER Evaluation  (mode=%s, sample_size=%d, concurrency=%d)"
+        % (mode, sample_size, config.CONCURRENCY)
     )
     print("=" * 60)
 
@@ -294,6 +335,107 @@ async def run_experiment(
 
     db_path = config.QASPER_DB
     _init_db(db_path)
+
+    # ── Per-question mode: insert one paper at a time, retrieve, then delete ──
+    if mode == "per_question":
+        engine = create_engine(f"sqlite:///{db_path}")
+        tracker = TokenTracker(config.TIKTOKEN_ENCODING)
+        op = OperationTracker(tracker)
+        agent = build_agent(db_path, tracker, verbose=verbose)
+        accuracy_llm = get_llm()
+        sem = asyncio.Semaphore(config.CONCURRENCY)
+
+        rng = random.Random(42)
+        retrieve_qa = rng.sample(all_qa, min(sample_size, len(all_qa)))
+        papers_by_id = {p["id"]: p for p in papers}
+
+        qa_by_paper: Dict[str, List[Dict]] = defaultdict(list)
+        for qa in retrieve_qa:
+            qa_by_paper[qa["paper_id"]].append(qa)
+
+        per_item: list = []
+        for pid, qa_list in qa_by_paper.items():
+            _insert_paper_group(engine, papers_by_id[pid])
+
+            async def _do_retrieve(qa):
+                prompt = (
+                    f"Using the research paper data stored in the database for "
+                    f"paper_id '{qa['paper_id']}' (title: \"{qa['title']}\"), "
+                    f"answer the following question. "
+                    f"Search in the 'papers', 'sections', and 'section_chunks' tables. "
+                    f"If the answer cannot be found, reply 'unanswerable'.\n\n"
+                    f"Question: {qa['question']}"
+                )
+                async with sem:
+                    with op.track("retrieve"):
+                        return await arun_agent(agent, prompt)
+
+            answers = await _run_concurrent(
+                [_do_retrieve(qa) for qa in qa_list], f"retrieve ({pid})"
+            )
+
+            _delete_paper_group(engine, pid)
+
+            for qa, answer in zip(qa_list, answers):
+                answer = answer or ""
+                golds = qa["gold_answers"]
+                per_item.append(
+                    {
+                        "paper_id": qa["paper_id"],
+                        "question_id": qa["question_id"],
+                        "question": qa["question"],
+                        "answer_type": qa["answer_type"],
+                        "ground_truth": golds,
+                        "prediction": answer,
+                        "f1": token_f1(answer, golds),
+                        "recall": token_recall(answer, golds),
+                        "accuracy": accuracy(
+                            accuracy_llm, qa["question"], answer, golds, "qasper"
+                        ),
+                    }
+                )
+
+        engine.dispose()
+
+        questions = [item["question"] for item in per_item]
+        predictions = [item["prediction"] for item in per_item]
+        ground_truths = [item["ground_truth"] for item in per_item]
+        qa_metrics = compute_metrics(
+            accuracy_llm, questions, predictions, ground_truths, "qasper"
+        )
+
+        type_preds: dict = defaultdict(list)
+        type_gts: dict = defaultdict(list)
+        type_questions: dict = defaultdict(list)
+        for item in per_item:
+            atype = item["answer_type"]
+            type_questions[atype].append(item["question"])
+            type_preds[atype].append(item["prediction"])
+            type_gts[atype].append(item["ground_truth"])
+        type_metrics = {
+            t: compute_metrics(
+                accuracy_llm, type_questions[t], type_preds[t], type_gts[t], "qasper"
+            )
+            for t in sorted(type_preds)
+        }
+
+        report = {
+            "dataset": "QASPER",
+            "mode": "per_question",
+            "sample_size": sample_size,
+            "concurrency": config.CONCURRENCY,
+            "num_papers": len(papers),
+            "num_qa_total": len(all_qa),
+            "num_retrieve": len(retrieve_qa),
+            "qa_metrics": qa_metrics,
+            "qa_metrics_by_answer_type": type_metrics,
+            "retrieve_metrics": op.summary("retrieve"),
+            "per_item": per_item,
+        }
+        _print_report(report)
+        return report
+
+    # ── Bulk mode ─────────────────────────────────────────────────────────────
     bulk_time = _bulk_insert(db_path, papers)
 
     tracker = TokenTracker(config.TIKTOKEN_ENCODING)
@@ -418,6 +560,7 @@ async def run_experiment(
 
     report = {
         "dataset": "QASPER",
+        "mode": "bulk",
         "sample_size": sample_size,
         "concurrency": config.CONCURRENCY,
         "num_papers": len(papers),
@@ -440,7 +583,7 @@ async def run_experiment(
 
 def _print_report(r: Dict) -> None:
     print("\n" + "-" * 60)
-    print("  QASPER Results")
+    print(f"  QASPER Results  (mode={r.get('mode', 'bulk')})")
     print("-" * 60)
     qm = r["qa_metrics"]
     print(f"  F1:       {qm['f1']:.4f}")
@@ -453,7 +596,9 @@ def _print_report(r: Dict) -> None:
             f"  [{t}]  F1={m['f1']:.4f}  Recall={m['recall']:.4f}  Acc={m['accuracy']:.4f}"
         )
     print()
-    print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
+
+    if r.get("mode") == "bulk" and "bulk_insert_time" in r:
+        print(f"  Bulk insert time: {r['bulk_insert_time']:.2f}s")
 
     for op_name in ("insert", "retrieve", "delete"):
         m = r.get(f"{op_name}_metrics", {})

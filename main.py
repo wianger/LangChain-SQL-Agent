@@ -50,7 +50,7 @@ async def _async_main(args) -> None:
         from run_locomo import run_experiment as run_locomo
 
         sample = 9999 if args.full else args.sample_size
-        report = await run_locomo(sample_size=sample, verbose=args.verbose)
+        report = await run_locomo(sample_size=sample, verbose=args.verbose, mode=args.mode)
         path = _save_report(report, "locomo")
         print(f"\n[saved] {path}")
         results["locomo"] = report
@@ -59,7 +59,7 @@ async def _async_main(args) -> None:
         from run_syllabusqa import run_experiment as run_syllabusqa
 
         sample = 9999 if args.full else args.sample_size
-        report = await run_syllabusqa(sample_size=sample, verbose=args.verbose)
+        report = await run_syllabusqa(sample_size=sample, verbose=args.verbose, mode=args.mode)
         path = _save_report(report, "syllabusqa")
         print(f"\n[saved] {path}")
         results["syllabusqa"] = report
@@ -68,7 +68,7 @@ async def _async_main(args) -> None:
         from run_financebench import run_experiment as run_financebench
 
         sample = 9999 if args.full else args.sample_size
-        report = await run_financebench(sample_size=sample, verbose=args.verbose)
+        report = await run_financebench(sample_size=sample, verbose=args.verbose, mode=args.mode)
         path = _save_report(report, "financebench")
         print(f"\n[saved] {path}")
         results["financebench"] = report
@@ -77,7 +77,7 @@ async def _async_main(args) -> None:
         from run_qasper import run_experiment as run_qasper
 
         sample = 9999 if args.full else args.sample_size
-        report = await run_qasper(sample_size=sample, verbose=args.verbose)
+        report = await run_qasper(sample_size=sample, verbose=args.verbose, mode=args.mode)
         path = _save_report(report, "qasper")
         print(f"\n[saved] {path}")
         results["qasper"] = report
@@ -86,7 +86,7 @@ async def _async_main(args) -> None:
         from run_clapnq import run_experiment as run_clapnq
 
         sample = 9999 if args.full else args.sample_size
-        report = await run_clapnq(sample_size=sample, verbose=args.verbose)
+        report = await run_clapnq(sample_size=sample, verbose=args.verbose, mode=args.mode)
         path = _save_report(report, "clapnq")
         print(f"\n[saved] {path}")
         results["clapnq"] = report
@@ -95,7 +95,7 @@ async def _async_main(args) -> None:
         from run_hotpotqa import run_experiment as run_hotpotqa
 
         sample = 9999 if args.full else args.sample_size
-        report = await run_hotpotqa(sample_size=sample, verbose=args.verbose)
+        report = await run_hotpotqa(sample_size=sample, verbose=args.verbose, mode=args.mode)
         path = _save_report(report, "hotpotqa")
         print(f"\n[saved] {path}")
         results["hotpotqa"] = report
@@ -157,6 +157,12 @@ def main() -> None:
         "--full",
         action="store_true",
         help="Run full evaluation (overrides --sample-size with full dataset size)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["bulk", "per-question"],
+        default="bulk",
+        help="bulk: insert all docs then query; per-question: insert only related docs per QA group",
     )
     parser.add_argument("--verbose", action="store_true", help="Print agent steps")
     args = parser.parse_args()

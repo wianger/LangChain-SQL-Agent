@@ -291,18 +291,21 @@ def compute_metrics(
     predictions: List[str],
     ground_truths: List[Union[str, List[str]]],
     dataset_name: str = "Locomo",
+    evidences: List[Union[str, List[str]]] | None = None,
 ) -> Dict[str, Any]:
     """Return averaged F1, recall, and accuracy over (pred, gt) pairs.
 
-    ``accuracy_score`` is normalised to 0.0-1.0 (raw score / 4).
-    ``accuracy_raw`` is the mean raw score (0-4 scale).
+    If *evidences* is provided, recall is computed against evidence texts
+    instead of ground_truths.  ``accuracy`` is normalised to 0.0-1.0
+    (raw score / 4).  ``accuracy_raw`` is the mean raw score (0-4 scale).
     """
     assert len(predictions) == len(ground_truths)
     n = len(predictions)
     if n == 0:
         return {"f1": 0.0, "recall": 0.0, "accuracy": 0.0, "accuracy_raw": 0.0}
+    recall_targets = evidences if evidences is not None else ground_truths
     f1s = [token_f1(p, g) for p, g in zip(predictions, ground_truths)]
-    recalls = [token_recall(p, g) for p, g in zip(predictions, ground_truths)]
+    recalls = [token_recall(p, e) for p, e in zip(predictions, recall_targets)]
     acc_results = [
         accuracy(llm, q, p, g, dataset_name)
         for q, p, g in zip(questions, predictions, ground_truths)
