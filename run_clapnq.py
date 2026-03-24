@@ -12,7 +12,7 @@ Data format (annotated_data/):
 Pipeline
 --------
 1.  Load dev answerable + unanswerable JSONL -> populate SQLite
-2.  Agent-based INSERT / RETRIEVE / DELETE with asyncio concurrency
+2.  SQLAlchemy-based INSERT / DELETE + Agent-based RETRIEVE with asyncio concurrency
 3.  Report F1, recall, accuracy + time / token costs
 """
 

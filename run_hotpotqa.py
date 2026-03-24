@@ -13,7 +13,7 @@ Data files
 Pipeline
 --------
 1.  Load articles -> populate SQLite (articles + article_chunks)
-2.  Agent-based INSERT / RETRIEVE / DELETE with asyncio concurrency
+2.  SQLAlchemy-based INSERT / DELETE + Agent-based RETRIEVE with asyncio concurrency
 3.  Report F1, recall, accuracy + time / token costs
 """
 
@@ -406,7 +406,9 @@ async def run_experiment(
             type_preds[t].append(item["prediction"])
             type_gts[t].append(item["ground_truth"])
             type_questions[t].append(item["question"])
-            type_evidences[t].append(item["evidence_sentences"] or [item["ground_truth"]])
+            type_evidences[t].append(
+                item["evidence_sentences"] or [item["ground_truth"]]
+            )
             type_retrieved[t].append(item.get("retrieved_texts", []))
         type_metrics = {
             t: compute_metrics(

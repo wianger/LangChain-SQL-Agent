@@ -10,7 +10,7 @@ Answer types:  extractive  |  free_form  |  yes_no  |  unanswerable
 Pipeline
 --------
 1.  Load test.json (JSONL) -> populate SQLite with paper sections
-2.  Agent-based INSERT / RETRIEVE / DELETE with asyncio concurrency
+2.  SQLAlchemy-based INSERT / DELETE + Agent-based RETRIEVE with asyncio concurrency
 3.  Report F1, recall, accuracy + time / token costs
 """
 
@@ -173,7 +173,9 @@ def _extract_qa(papers: List[Dict]) -> List[Dict]:
                     "question_id": question_ids[idx],
                     "question": questions[idx],
                     "gold_answers": gold_texts,
-                    "evidence_texts": unique_evidence if unique_evidence else gold_texts,
+                    "evidence_texts": unique_evidence
+                    if unique_evidence
+                    else gold_texts,
                     "answer_type": majority_type,
                 }
             )
@@ -443,9 +445,7 @@ async def run_experiment(
                         "prediction": answer,
                         "retrieved_texts": retrieved,
                         "f1": token_f1(answer, golds),
-                        "recall": token_recall(
-                            answer, ev, retrieved_texts=retrieved
-                        ),
+                        "recall": token_recall(answer, ev, retrieved_texts=retrieved),
                         "accuracy": accuracy(
                             accuracy_llm, qa["question"], answer, golds, "qasper"
                         ),

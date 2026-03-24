@@ -1,7 +1,7 @@
 """LoCoMo evaluation pipeline (async-concurrent version).
 
 1.  Load locomo10.json -> populate SQLite
-2.  Agent-based INSERT / RETRIEVE / DELETE with asyncio concurrency
+2.  SQLAlchemy-based INSERT / DELETE + Agent-based RETRIEVE with asyncio concurrency
 3.  Report F1, recall, accuracy + time / token costs
 """
 

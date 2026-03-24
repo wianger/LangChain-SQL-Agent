@@ -1,6 +1,6 @@
 # LangChain SQL Agent 评估
 
-基于 **SQLDatabaseToolkit + AgentExecutor (ReAct tool-calling)** 的 LangChain SQL Agent，
+基于 **SQLDatabaseToolkit + LangGraph (ReAct tool-calling)** 的 LangChain SQL Agent，
 在 **LoCoMo** 和 **SyllabusQA** 数据集上进行评估。
 
 ## 项目结构
@@ -9,7 +9,7 @@
 ├── config.py           # 配置 (API, 路径, 参数)
 ├── token_tracker.py    # tiktoken (cl100k_base) token 计数 + LangChain 回调
 ├── metrics.py          # 评估指标: token-level F1, Recall, Accuracy
-├── sql_agent.py        # SQL Agent 构建 (SQLDatabaseToolkit + AgentExecutor)
+├── sql_agent.py        # SQL Agent 构建 (SQLDatabaseToolkit + LangGraph)
 ├── run_locomo.py       # LoCoMo 数据集评估流程
 ├── run_syllabusqa.py   # SyllabusQA 数据集评估流程
 ├── main.py             # 主入口
@@ -47,16 +47,16 @@ python main.py --verbose
 | Accuracy | 规范化后的精确匹配 |
 | 检索时间 | Agent 从 SQL 数据库中查询并回答问题的平均时间 |
 | 检索 Token 成本 | 使用 tiktoken cl100k_base 统计的 prompt + completion tokens |
-| 插入时间/成本 | Agent 通过生成 INSERT SQL 插入数据的时间和 token 消耗 |
-| 删除时间/成本 | Agent 通过生成 DELETE SQL 删除数据的时间和 token 消耗 |
+| 插入时间/成本 | 数据准备阶段的插入耗时和 token 消耗（非只读 Agent 执行） |
+| 删除时间/成本 | 数据准备阶段的删除耗时和 token 消耗（非只读 Agent 执行） |
 
 ## 架构说明
 
 - **模型**: doubao-seed-1-8-251228 (Volcano Engine ARK API)
 - **Token 计数**: tiktoken cl100k_base 编码器
-- **Agent**: `create_tool_calling_agent` + `AgentExecutor` (ReAct 工具调用)
+- **Agent**: LangGraph 状态图 (assistant -> tools -> assistant) 的 ReAct 工具调用
 - **数据库**: SQLite (通过 SQLAlchemy)
-- **工具集**: SQLDatabaseToolkit (sql_db_query, sql_db_schema, sql_db_list_tables, sql_db_query_checker) + 自定义 sql_db_write 工具
+- **工具集**: SQLDatabaseToolkit (sql_db_query, sql_db_schema, sql_db_list_tables, sql_db_query_checker) 四工具只读模式
 
 ## 数据集
 
