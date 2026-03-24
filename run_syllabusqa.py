@@ -553,9 +553,7 @@ async def run_experiment(
         "bulk_delete_time": bulk_delete_time,
         "qa_metrics": qa_metrics,
         "qa_metrics_by_type": type_metrics,
-        "insert_metrics": op.summary("insert"),
         "retrieve_metrics": op.summary("retrieve"),
-        "delete_metrics": op.summary("delete"),
         "per_item": per_item,
     }
 
@@ -587,7 +585,7 @@ def _print_report(r: Dict) -> None:
         print(f"  Setup time: {r['setup_time']:.2f}s")
         print(f"  Teardown time: {r['teardown_time']:.2f}s")
 
-    for op_name in ("insert", "retrieve", "delete"):
+    for op_name in "retrieve":
         m = r.get(f"{op_name}_metrics", {})
         if m:
             print(

@@ -631,9 +631,7 @@ async def run_experiment(
         "bulk_delete_time": bulk_delete_time,
         "qa_metrics": qa_metrics,
         "qa_metrics_by_answer_type": type_metrics,
-        "insert_metrics": op.summary("insert"),
         "retrieve_metrics": op.summary("retrieve"),
-        "delete_metrics": op.summary("delete"),
         "per_item": per_item,
     }
 
@@ -662,7 +660,7 @@ def _print_report(r: Dict) -> None:
     if r.get("mode") == "bulk" and "bulk_delete_time" in r:
         print(f"  Bulk delete time: {r['bulk_delete_time']:.2f}s")
 
-    for op_name in ("insert", "retrieve", "delete"):
+    for op_name in "retrieve":
         m = r.get(f"{op_name}_metrics", {})
         if m:
             print(

@@ -676,9 +676,7 @@ async def run_experiment(
         "qa_metrics": qa_metrics,
         "qa_metrics_by_type": type_metrics,
         "qa_metrics_by_reasoning": reasoning_metrics,
-        "insert_metrics": op.summary("insert"),
         "retrieve_metrics": op.summary("retrieve"),
-        "delete_metrics": op.summary("delete"),
         "per_item": per_item,
     }
 
@@ -714,7 +712,7 @@ def _print_report(r: Dict) -> None:
         print(f"  Teardown time: {r['teardown_time']:.2f}s")
         print(f"  Num doc groups: {r['num_doc_groups']}")
 
-    for op_name in ("insert", "retrieve", "delete"):
+    for op_name in "retrieve":
         m = r.get(f"{op_name}_metrics", {})
         if m:
             print(
